@@ -957,6 +957,65 @@ function connect() {
                 const context = SillyTavern.getContext();
                 let commandSuccess = false;
 
+                const sendChatSelectionForCharacter = async (characterId, introText = '', pageArgRaw = null) => {
+                    if (characterId === undefined || characterId === null) {
+                        if (ws && ws.readyState === WebSocket.OPEN) {
+                            ws.send(JSON.stringify({ type: 'ai_reply', chatId: data.chatId, text: '请先选择一个角色。' }));
+                        }
+                        return true;
+                    }
+
+                    const chatFiles = await getPastCharacterChats(characterId);
+                    const CHAT_PAGE_SIZE = 10;
+                    const chatPageArg = pageArgRaw ? parseInt(pageArgRaw) : 1;
+                    const chatPage = isNaN(chatPageArg) ? 1 : chatPageArg;
+                    const chatTotalPages = Math.max(1, Math.ceil(chatFiles.length / CHAT_PAGE_SIZE));
+                    const chatCurrentPage = Math.max(1, Math.min(chatPage, chatTotalPages));
+                    const chatStartIndex = (chatCurrentPage - 1) * CHAT_PAGE_SIZE;
+                    const chatEndIndex = Math.min(chatStartIndex + CHAT_PAGE_SIZE, chatFiles.length);
+                    const pageChats = chatFiles.slice(chatStartIndex, chatEndIndex);
+
+                    let chatReplyText = introText ? `${introText}\n\n` : '';
+                    const chatButtons = [[{ text: '🆕 新建聊天', callback_data: 'cmd_new' }]];
+
+                    if (chatFiles.length > 0) {
+                        chatReplyText += `💬 聊天 (${chatCurrentPage}/${chatTotalPages}页)\n`;
+                        pageChats.forEach((chat, index) => {
+                            const globalIndex = chatStartIndex + index + 1;
+                            let chatName = chat.file_name.replace('.jsonl', '');
+                            chatName = chatName.length > 20 ? chatName.substring(0, 20) + '..' : chatName;
+                            chatReplyText += `${globalIndex}. ${chatName}\n`;
+                        });
+                        chatReplyText += `\n选择已有聊天，或点击“新建聊天”。`;
+
+                        pageChats.forEach((chat, index) => {
+                            const globalIndex = chatStartIndex + index + 1;
+                            const chatName = chat.file_name.replace('.jsonl', '');
+                            const label = `${globalIndex}. ${chatName}`.slice(0, 60);
+                            chatButtons.push([{ text: label, callback_data: `cmd_switchchat_${globalIndex}` }]);
+                        });
+                    } else {
+                        chatReplyText += '当前角色没有任何聊天记录。可点击“新建聊天”开始。';
+                    }
+
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            type: 'ai_reply',
+                            chatId: data.chatId,
+                            text: chatReplyText,
+                            reply_markup: {
+                                inline_keyboard: chatButtons
+                            },
+                            pagination: {
+                                currentPage: chatCurrentPage,
+                                totalPages: chatTotalPages,
+                                type: 'listchats'
+                            }
+                        }));
+                    }
+                    return true;
+                };
+
                 try {
                     if (await handleBridgeControlCommand(data, context)) {
                         return;
@@ -1031,8 +1090,10 @@ function connect() {
                             if (targetChar) {
                                 const charIndex = characters.indexOf(targetChar);
                                 await selectCharacterById(charIndex);
-                                replyText = `已成功切换到角色 "${targetName}"。`;
                                 commandSuccess = true;
+                                await sendChatSelectionForCharacter(charIndex, `已成功切换到角色 "${targetName}"。
+请选择聊天记录，或新建聊天：`);
+                                return;
                             } else {
                                 replyText = `角色 "${targetName}" 未找到。`;
                             }
@@ -1043,57 +1104,9 @@ function connect() {
                                 replyText = '请先选择一个角色。';
                                 break;
                             }
-                            const chatFiles = await getPastCharacterChats(context.characterId);
-                            if (chatFiles.length > 0) {
-                                // 分页参数：每页显示10个聊天记录
-                                const CHAT_PAGE_SIZE = 10;
-                                const chatPageArg = data.args && data.args[0] ? parseInt(data.args[0]) : 1;
-                                const chatPage = isNaN(chatPageArg) ? 1 : chatPageArg;
-                                const chatTotalPages = Math.ceil(chatFiles.length / CHAT_PAGE_SIZE);
-                                const chatCurrentPage = Math.max(1, Math.min(chatPage, chatTotalPages));
-                                const chatStartIndex = (chatCurrentPage - 1) * CHAT_PAGE_SIZE;
-                                const chatEndIndex = Math.min(chatStartIndex + CHAT_PAGE_SIZE, chatFiles.length);
-                                const pageChats = chatFiles.slice(chatStartIndex, chatEndIndex);
-
-                                replyText = `💬 聊天 (${chatCurrentPage}/${chatTotalPages}页)\n`;
-                                pageChats.forEach((chat, index) => {
-                                    const globalIndex = chatStartIndex + index + 1;
-                                    let chatName = chat.file_name.replace('.jsonl', '');
-                                    // 截断过长的聊天名
-                                    chatName = chatName.length > 20 ? chatName.substring(0, 20) + '..' : chatName;
-                                    replyText += `${globalIndex}. ${chatName}\n`;
-                                });
-                                replyText += `\n切换: /switchchat_数字`;
-
-                                const chatButtons = pageChats.map((chat, index) => {
-                                    const globalIndex = chatStartIndex + index + 1;
-                                    let chatName = chat.file_name.replace('.jsonl', '');
-                                    const label = `${globalIndex}. ${chatName}`.slice(0, 60);
-                                    return [{ text: label, callback_data: `cmd_switchchat_${globalIndex}` }];
-                                });
-
-                                // 发送带分页和切换按钮的回复
-                                if (ws && ws.readyState === WebSocket.OPEN) {
-                                    ws.send(JSON.stringify({
-                                        type: 'ai_reply',
-                                        chatId: data.chatId,
-                                        text: replyText,
-                                        reply_markup: {
-                                            inline_keyboard: chatButtons
-                                        },
-                                        pagination: {
-                                            currentPage: chatCurrentPage,
-                                            totalPages: chatTotalPages,
-                                            type: 'listchats'
-                                        }
-                                    }));
-                                }
-                                return;
-                            } else {
-                                replyText = '当前角色没有任何聊天记录。';
-                            }
-                            commandSuccess = true;
-                            break;
+                            const chatPageArg = data.args && data.args[0] ? data.args[0] : 1;
+                            await sendChatSelectionForCharacter(context.characterId, '', chatPageArg);
+                            return;
                         }
                         case 'switchchat': {
                             if (!data.args || data.args.length === 0) {
@@ -1121,8 +1134,10 @@ function connect() {
                                     const targetChar = characters[index];
                                     const charIndex = context.characters.indexOf(targetChar);
                                     await selectCharacterById(charIndex);
-                                    replyText = `已切换到角色 "${targetChar.name}"。`;
                                     commandSuccess = true;
+                                    await sendChatSelectionForCharacter(charIndex, `已切换到角色 "${targetChar.name}"。
+请选择聊天记录，或新建聊天：`);
+                                    return;
                                 } else {
                                     replyText = `无效的角色序号: ${index + 1}。请使用 /listchars 查看可用角色。`;
                                 }

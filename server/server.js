@@ -1062,9 +1062,11 @@ async function handleTelegramCommand(command, args, chatId, userId = chatId) {
         replyText += `💬 聊天管理\n`;
         replyText += `/new - 开始新聊天\n`;
         replyText += `/listchats [页码] - 聊天记录列表\n`;
+        replyText += `/switchchat - 显示聊天记录切换按钮\n`;
         replyText += `/switchchat_<序号> - 切换聊天\n\n`;
         replyText += `👤 角色管理\n`;
         replyText += `/listchars [页码] - 角色列表\n`;
+        replyText += `/switchchar - 显示角色切换按钮\n`;
         replyText += `/switchchar_<序号> - 切换角色\n\n`;
         replyText += `📤 上传导入\n`;
         replyText += `/upload - 上传导入角色卡/预设\n\n`;
@@ -1142,7 +1144,14 @@ async function handleTelegramCommand(command, args, chatId, userId = chatId) {
             return;
         case 'switchchar':
             if (args.length === 0) {
-                replyText = '请提供角色名称或序号。用法: /switchchar <角色名称> 或 /switchchar_数字';
+                // 无参数时直接打开角色列表，使用现有分页 + inline buttons 作为切换菜单
+                sillyTavernClient.send(JSON.stringify({
+                    type: 'execute_command',
+                    command: 'listchars',
+                    args: [],
+                    chatId: chatId
+                }));
+                return;
             } else {
                 // 发送命令到前端执行
                 sillyTavernClient.send(JSON.stringify({
@@ -1153,7 +1162,6 @@ async function handleTelegramCommand(command, args, chatId, userId = chatId) {
                 }));
                 return;
             }
-            break;
         case 'listchats':
             // 发送命令到前端执行（传递页码参数）
             sillyTavernClient.send(JSON.stringify({
@@ -1165,7 +1173,14 @@ async function handleTelegramCommand(command, args, chatId, userId = chatId) {
             return;
         case 'switchchat':
             if (args.length === 0) {
-                replyText = '请提供聊天记录名称。用法： /switchchat <聊天记录名称>';
+                // 无参数时直接打开当前角色的聊天记录列表，使用现有分页 + inline buttons 作为切换菜单
+                sillyTavernClient.send(JSON.stringify({
+                    type: 'execute_command',
+                    command: 'listchats',
+                    args: [],
+                    chatId: chatId
+                }));
+                return;
             } else {
                 // 发送命令到前端执行
                 sillyTavernClient.send(JSON.stringify({
@@ -1176,7 +1191,6 @@ async function handleTelegramCommand(command, args, chatId, userId = chatId) {
                 }));
                 return;
             }
-            break;
         default:
             // 处理特殊格式的命令，如 switchchar_1, switchchat_2 等
             const charMatch = command.match(/^switchchar_(\d+)$/);
