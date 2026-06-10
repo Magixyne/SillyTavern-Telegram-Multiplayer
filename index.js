@@ -21,7 +21,21 @@ import {
     openCharacterChat,
     Generate,
     setExternalAbortController,
+    getRequestHeaders,
+    characters,
 } from "../../../../script.js";
+
+import {
+    oai_settings,
+    openai_settings,
+    openai_setting_names,
+    chat_completion_sources,
+} from "../../../../scripts/openai.js";
+
+import {
+    SECRET_KEYS,
+    writeSecret,
+} from "../../../../scripts/secrets.js";
 
 const MODULE_NAME = 'SillyTavern-Telegram-Connector';
 const DEFAULT_SETTINGS = {
@@ -179,7 +193,583 @@ function cancelReconnect() {
 function reloadPage() {
     window.location.reload();
 }
-// ---
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+function getBridgeConfig(data = {}) {
+    return data.bridgeConfig || { models: {}, profiles: {}, options: {} };
+}
+
+function sendBridgeReply(chatId, text, replyMarkup = null) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) return;
+    const payload = { type: 'ai_reply', chatId, text };
+    if (replyMarkup) payload.reply_markup = replyMarkup;
+    ws.send(JSON.stringify(payload));
+}
+
+function base64ToFile(base64, fileName) {
+    const binary = atob(base64);
+    const bytes = new Uint8Array(binary.length);
+    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+    return new File([bytes], fileName);
+}
+
+function safePresetName(fileName) {
+    return String(fileName || 'Imported Preset').replace(/\.[^/.]+$/, '').replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').trim() || 'Imported Preset';
+}
+
+function uniquePresetName(baseName) {
+    let name = baseName;
+    let i = 1;
+    while (Object.prototype.hasOwnProperty.call(openai_setting_names, name)) {
+        name = `${baseName}_${i++}`;
+    }
+    return name;
+}
+
+async function importBridgeCharacterUpload(upload, switchAfter = false) {
+    const file = base64ToFile(upload.dataBase64, upload.fileName);
+    const ext = String(upload.fileName || '').split('.').pop().toLowerCase();
+    if (!['png', 'json'].includes(ext)) throw new Error(`Unsupported character file: ${ext}`);
+    const formData = new FormData();
+    formData.append('avatar', file);
+    formData.append('file_type', ext);
+    formData.append('preserved_name', safePresetName(upload.fileName));
+    const result = await fetch('/api/characters/import', {
+        method: 'POST',
+        body: formData,
+        headers: getRequestHeaders({ omitContentType: true }),
+        cache: 'no-cache',
+    });
+    if (!result.ok) throw new Error(`Import failed: HTTP ${result.status}`);
+    const data = await result.json();
+    if (data.error || !data.file_name) throw new Error('SillyTavern rejected the character file');
+
+    if (switchAfter) {
+        await sleep(800);
+        const avatarName = `${data.file_name}.png`;
+        const index = characters.findIndex(c => c.avatar === avatarName || c.name === data.file_name);
+        if (index >= 0) {
+            await selectCharacterById(index);
+        } else {
+            // Fallback: reload to refresh the character list if the imported card is not in the in-memory list yet.
+            setTimeout(() => window.location.reload(), 1200);
+        }
+    } else {
+        setTimeout(() => window.location.reload(), 1200);
+    }
+    return `${data.file_name}.png`;
+}
+
+async function importBridgeOpenAIPresetUpload(upload, switchAfter = false) {
+    const text = atob(upload.dataBase64);
+    let presetBody;
+    try {
+        presetBody = JSON.parse(text);
+    } catch (error) {
+        throw new Error('Invalid JSON preset');
+    }
+    const sensitiveFields = ['api_key', 'api_key_openai', 'api_key_custom', 'custom_url', 'proxy_password', 'reverse_proxy', 'chat_completion_proxy'];
+    // For Telegram import, remove endpoint/key-like fields by default. Connection profile switching manages keys separately.
+    sensitiveFields.forEach(field => {
+        if (Object.prototype.hasOwnProperty.call(presetBody, field)) delete presetBody[field];
+    });
+    const name = uniquePresetName(safePresetName(upload.fileName));
+    const response = await fetch('/api/presets/save', {
+        method: 'POST',
+        headers: getRequestHeaders(),
+        body: JSON.stringify({ apiId: 'openai', name, preset: presetBody }),
+    });
+    if (!response.ok) throw new Error(`Preset save failed: HTTP ${response.status}`);
+    const data = await response.json();
+    if (switchAfter) {
+        openai_settings.push(presetBody);
+        openai_setting_names[data.name] = openai_settings.length - 1;
+        oai_settings.preset_settings_openai = data.name;
+        const option = document.createElement('option');
+        option.selected = true;
+        option.value = String(openai_settings.length - 1);
+        option.innerText = data.name;
+        $('#settings_preset_openai').append(option).trigger('change');
+        saveSettingsDebounced();
+    }
+    return data.name;
+}
+
+
+function getCurrentModelSelector(source = oai_settings.chat_completion_source) {
+    const map = {
+        [chat_completion_sources.DEEPSEEK]: { selector: '#model_deepseek_select', setting: 'deepseek_model' },
+        [chat_completion_sources.CUSTOM]: { selector: '#model_custom_select', input: '#custom_model_id', setting: 'custom_model' },
+        [chat_completion_sources.OPENROUTER]: { selector: '#model_openrouter_select', setting: 'openrouter_model' },
+        [chat_completion_sources.OPENAI]: { selector: '#model_openai_select', setting: 'openai_model' },
+        [chat_completion_sources.CLAUDE]: { selector: '#model_claude_select', setting: 'claude_model' },
+        [chat_completion_sources.MAKERSUITE]: { selector: '#model_google_select', setting: 'google_model' },
+        [chat_completion_sources.VERTEXAI]: { selector: '#model_vertexai_select', setting: 'vertexai_model' },
+        [chat_completion_sources.GROQ]: { selector: '#model_groq_select', setting: 'groq_model' },
+        [chat_completion_sources.MISTRALAI]: { selector: '#model_mistralai_select', setting: 'mistralai_model' },
+        [chat_completion_sources.COHERE]: { selector: '#model_cohere_select', setting: 'cohere_model' },
+        [chat_completion_sources.PERPLEXITY]: { selector: '#model_perplexity_select', setting: 'perplexity_model' },
+        [chat_completion_sources.AIMLAPI]: { selector: '#model_aimlapi_select', setting: 'aimlapi_model' },
+        [chat_completion_sources.XAI]: { selector: '#model_xai_select', setting: 'xai_model' },
+        [chat_completion_sources.POLLINATIONS]: { selector: '#model_pollinations_select', setting: 'pollinations_model' },
+        [chat_completion_sources.MOONSHOT]: { selector: '#model_moonshot_select', setting: 'moonshot_model' },
+        [chat_completion_sources.COMETAPI]: { selector: '#model_cometapi_select', setting: 'cometapi_model' },
+        [chat_completion_sources.CHUTES]: { selector: '#model_chutes_select', setting: 'chutes_model' },
+        [chat_completion_sources.SILICONFLOW]: { selector: '#model_siliconflow_select', setting: 'siliconflow_model' },
+        [chat_completion_sources.ELECTRONHUB]: { selector: '#model_electronhub_select', setting: 'electronhub_model' },
+        [chat_completion_sources.NANOGPT]: { selector: '#model_nanogpt_select', setting: 'nanogpt_model' },
+        [chat_completion_sources.MINIMAX]: { selector: '#model_minimax_select', setting: 'minimax_model' },
+        [chat_completion_sources.ZAI]: { selector: '#model_zai_select', setting: 'zai_model' },
+        [chat_completion_sources.WORKERS_AI]: { selector: '#model_workers_ai_select', setting: 'workers_ai_model' },
+    };
+    return map[source] || null;
+}
+
+function getCurrentModelId() {
+    const source = oai_settings.chat_completion_source;
+    const info = getCurrentModelSelector(source);
+    if (info?.setting && oai_settings[info.setting]) return oai_settings[info.setting];
+    if (source === chat_completion_sources.CUSTOM) return oai_settings.custom_model || $('#custom_model_id').val() || '';
+    return '';
+}
+
+function discoverCurrentModels() {
+    const source = oai_settings.chat_completion_source;
+    const info = getCurrentModelSelector(source);
+    const models = [];
+    if (info?.selector && $(info.selector).length) {
+        $(info.selector).find('option').each(function () {
+            const value = String($(this).val() || '').trim();
+            const label = String($(this).text() || value).trim();
+            if (value) models.push({ id: value, label });
+        });
+    }
+    const current = getCurrentModelId();
+    if (current && !models.some(m => m.id === current)) {
+        models.unshift({ id: current, label: current });
+    }
+    return { source, models };
+}
+
+function normalizeUrlForCompare(value) {
+    return String(value || '').replace(/\/+$/, '');
+}
+
+function getProviderList(config = null) {
+    const configured = Object.entries((config && config.providers) || {})
+        .filter(([, provider]) => provider && provider.enabled !== false)
+        .map(([id, provider], index) => {
+            const source = provider.source || id;
+            const customUrl = provider.customUrl || '';
+            const current = source === chat_completion_sources.CUSTOM && customUrl
+                ? oai_settings.chat_completion_source === chat_completion_sources.CUSTOM && normalizeUrlForCompare(oai_settings.custom_url) === normalizeUrlForCompare(customUrl)
+                : source === oai_settings.chat_completion_source;
+            return {
+                index: index + 1,
+                id,
+                source,
+                customUrl,
+                defaultModel: provider.defaultModel || '',
+                label: provider.label || id,
+                current,
+                note: provider.note || '',
+            };
+        });
+
+    // Default behavior: show only Bridge-configured/imported connection profiles, not every SillyTavern-supported source.
+    if (configured.length || config?.options?.providersMode === 'configured') {
+        return configured;
+    }
+
+    const providers = [];
+    const select = $('#chat_completion_source');
+    if (!select.length) return providers;
+    select.find('option').each(function (index) {
+        const id = String($(this).val() || '').trim();
+        const label = String($(this).text() || id).trim();
+        if (id) providers.push({ index: index + 1, id, source: id, customUrl: '', defaultModel: '', label, current: id === oai_settings.chat_completion_source, note: '' });
+    });
+    return providers;
+}
+function findProviderByArg(arg, config = null) {
+    const providers = getProviderList(config);
+    const text = String(arg || '').trim();
+    if (/^\d+$/.test(text)) return providers[Number(text) - 1] || null;
+    return providers.find(p =>
+        p.id.toLowerCase() === text.toLowerCase()
+        || p.source.toLowerCase() === text.toLowerCase()
+        || p.label.toLowerCase() === text.toLowerCase()
+    ) || null;
+}
+
+function parseModelListArgs(args = []) {
+    const joined = args.join(' ').trim();
+    let page = 1;
+    let query = '';
+    if (/^\d+$/.test(joined)) {
+        page = Number(joined);
+    } else {
+        query = joined.toLowerCase();
+        const last = args[args.length - 1];
+        if (args.length > 1 && /^\d+$/.test(last)) {
+            page = Number(last);
+            query = args.slice(0, -1).join(' ').trim().toLowerCase();
+        }
+    }
+    return { page: Math.max(1, page || 1), query };
+}
+
+function getFilteredCurrentProviderModels(args = []) {
+    const { page, query } = parseModelListArgs(args);
+    const discovered = discoverCurrentModels();
+    const filtered = query
+        ? discovered.models.filter(m => m.id.toLowerCase().includes(query) || m.label.toLowerCase().includes(query))
+        : discovered.models;
+    const pageSize = 10;
+    const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+    const currentPage = Math.min(page, totalPages);
+    const start = (currentPage - 1) * pageSize;
+    return {
+        source: discovered.source,
+        query,
+        page: currentPage,
+        totalPages,
+        pageSize,
+        total: filtered.length,
+        models: filtered.slice(start, start + pageSize).map((m, i) => ({ ...m, index: start + i + 1 })),
+    };
+}
+
+function resolveCurrentProviderModelArg(arg, args = []) {
+    const text = String(arg || '').trim();
+    if (!text) return null;
+    const list = getFilteredCurrentProviderModels(args);
+    if (/^\d+$/.test(text)) {
+        const idx = Number(text);
+        return list.models.find(m => m.index === idx) || discoverCurrentModels().models[idx - 1] || null;
+    }
+    return discoverCurrentModels().models.find(m => m.id === text || m.id.toLowerCase() === text.toLowerCase()) || { id: text, label: text };
+}
+
+function getPresetList() {
+    const presets = [];
+    $('#settings_preset_openai option').each(function (index) {
+        const value = String($(this).val() || '').trim();
+        const name = String($(this).text() || value).trim();
+        if (name) presets.push({ index: index + 1, value, name });
+    });
+    return presets;
+}
+
+function findPresetByArg(arg) {
+    const presets = getPresetList();
+    const text = String(arg || '').trim();
+    if (/^\d+$/.test(text)) return presets[Number(text) - 1] || null;
+    return presets.find(p => p.name === text || p.value === text) || null;
+}
+
+function getEnabledModelEntries(config) {
+    return Object.entries(config.models || {}).filter(([, model]) => model && model.enabled !== false);
+}
+
+function resolveModelArg(arg, config) {
+    const text = String(arg || '').trim();
+    if (!text) return null;
+    const entries = getEnabledModelEntries(config);
+    const byAlias = entries.find(([alias]) => alias.toLowerCase() === text.toLowerCase());
+    if (byAlias) return { alias: byAlias[0], ...byAlias[1] };
+    const byModel = entries.find(([, model]) => String(model.model || '').toLowerCase() === text.toLowerCase());
+    if (byModel) return { alias: byModel[0], ...byModel[1] };
+    if (config.options?.allowDiscoveredModels) {
+        const discovered = discoverCurrentModels().models.find(m => m.id.toLowerCase() === text.toLowerCase());
+        if (discovered) return { alias: discovered.id, label: discovered.label, source: oai_settings.chat_completion_source, model: discovered.id, enabled: true };
+    }
+    return null;
+}
+
+async function switchChatCompletionSourceIfNeeded(source) {
+    if (!source || source === oai_settings.chat_completion_source) return;
+    const sourceSelect = $('#chat_completion_source');
+    if (!sourceSelect.length) throw new Error('找不到 chat_completion_source 控件');
+    if (!sourceSelect.find(`option[value="${source}"]`).length) throw new Error(`当前酒馆不支持源: ${source}`);
+    sourceSelect.val(source).trigger('change');
+    await sleep(800);
+}
+
+async function refreshCurrentProviderModelList(expectedModel = '') {
+    if (oai_settings.chat_completion_source !== chat_completion_sources.CUSTOM) {
+        return discoverCurrentModels().models.length;
+    }
+
+    // Clear stale options from the previous custom endpoint before asking SillyTavern to reconnect.
+    $('.model_custom_select').empty().append('<option value="">None</option>');
+    $('#api_button_openai').trigger('click');
+
+    const started = Date.now();
+    let lastSignature = '';
+    let stableSince = 0;
+    let lastCount = 0;
+
+    while (Date.now() - started < 15000) {
+        await sleep(500);
+        const models = discoverCurrentModels().models.filter(m => m.id);
+        const signature = models.map(m => m.id).join('|');
+        lastCount = models.length;
+
+        if (signature && signature === lastSignature) {
+            if (!stableSince) stableSince = Date.now();
+            // Wait until the list is stable for at least 1.5s. Do not stop just because the default model appeared.
+            if (Date.now() - stableSince >= 1500) {
+                return models.length;
+            }
+        } else {
+            lastSignature = signature;
+            stableSince = signature ? Date.now() : 0;
+        }
+    }
+
+    return lastCount;
+}
+
+
+async function applyProviderProfile(provider, selectedSecret = null) {
+    await switchChatCompletionSourceIfNeeded(provider.source);
+
+    if (provider.source === chat_completion_sources.CUSTOM) {
+        if (provider.customUrl) {
+            oai_settings.custom_url = provider.customUrl;
+            $('#custom_api_url_text').val(provider.customUrl).trigger('input');
+        }
+        if (selectedSecret?.apiKey) {
+            await writeSecret(SECRET_KEYS.CUSTOM, selectedSecret.apiKey, provider.label || provider.id);
+        }
+        saveSettingsDebounced();
+        await refreshCurrentProviderModelList(provider.defaultModel || '');
+    }
+
+    if (provider.defaultModel) {
+        await switchModelByDefinition({
+            source: provider.source,
+            model: provider.defaultModel,
+            label: provider.defaultModel,
+        });
+    } else {
+        saveSettingsDebounced();
+        await sleep(300);
+    }
+}
+
+async function switchModelByDefinition(definition) {
+    if (!definition?.model) throw new Error('模型定义缺少 model 字段');
+    await switchChatCompletionSourceIfNeeded(definition.source);
+    const source = oai_settings.chat_completion_source;
+    const info = getCurrentModelSelector(source);
+    if (!info) throw new Error(`当前源 ${source} 暂不支持 Telegram 切模型`);
+    if (source === chat_completion_sources.CUSTOM) {
+        if (info.selector && $(info.selector).length) {
+            const select = $(info.selector);
+            if (!select.find(`option[value="${definition.model}"]`).length) select.append(new Option(definition.model, definition.model));
+            select.val(definition.model).trigger('change');
+        }
+        if (info.input && $(info.input).length) $(info.input).val(definition.model).trigger('input');
+        oai_settings.custom_model = definition.model;
+    } else {
+        if (!$(info.selector).length) throw new Error(`找不到模型控件: ${info.selector}`);
+        if (!$(info.selector).find(`option[value="${definition.model}"]`).length) throw new Error(`当前模型列表中未发现: ${definition.model}`);
+        $(info.selector).val(definition.model).trigger('change');
+        if (info.setting) oai_settings[info.setting] = definition.model;
+    }
+    saveSettingsDebounced();
+    await sleep(300);
+    const after = getCurrentModelId();
+    if (after !== definition.model) throw new Error(`模型切换后回读不一致: ${after || '(空)'}`);
+}
+
+async function switchPresetByNameOrIndex(arg) {
+    const preset = findPresetByArg(arg);
+    if (!preset) throw new Error(`未找到预设: ${arg}`);
+    const select = $('#settings_preset_openai');
+    if (!select.length) throw new Error('找不到预设选择控件');
+    select.val(preset.value).trigger('change');
+    saveSettingsDebounced();
+    await sleep(700);
+    return preset;
+}
+
+function buildStatusText(config) {
+    const enabledModels = getEnabledModelEntries(config).map(([alias, m]) => `${alias}: ${m.label || m.model} (${m.model})`);
+    const profiles = Object.entries(config.profiles || {}).map(([name, p]) => `${name}: ${p.label || name} / model=${p.modelAlias || p.model || '-'} / preset=${p.preset || '-'}`);
+    const providers = getProviderList(config).map(p => `${p.id}: ${p.label} -> ${p.source}${p.current ? ' ← 当前' : ''}`);
+    return [
+        '📊 Bridge状态', '',
+        `当前源：${oai_settings.chat_completion_source}`,
+        `当前模型：${getCurrentModelId() || '(未设置)'}`,
+        `当前预设：${oai_settings.preset_settings_openai || '(未设置)'}`,
+        `连接绑定：${oai_settings.bind_preset_to_connection ? '开启' : '关闭'}`, '',
+        `已配置供应商：${providers.length || 0}`,
+        ...(providers.length ? providers.map(x => `- ${x}`) : []), '',
+        `已启用模型：${enabledModels.length || 0}`,
+        ...(enabledModels.length ? enabledModels.map(x => `- ${x}`) : []), '',
+        `Profiles：${profiles.length || 0}`,
+        ...(profiles.length ? profiles.map(x => `- ${x}`) : []),
+    ].join('\n');
+}
+
+async function handleBridgeControlCommand(data, context) {
+    const config = getBridgeConfig(data);
+    const command = data.command;
+    const args = data.args || [];
+
+    if (command === 'upload_import_char' || command === 'upload_import_switch') {
+        try {
+            if (!data.upload) throw new Error('Missing upload payload');
+            const fileName = await importBridgeCharacterUpload(data.upload, command === 'upload_import_switch');
+            const suffix = command === 'upload_import_switch' ? '\n已尝试切换到该角色。' : '\n角色列表将自动刷新。';
+            sendBridgeReply(data.chatId, `已导入角色卡：${fileName}${suffix}`);
+        } catch (error) {
+            console.error('[Telegram Bridge] character import failed', error);
+            sendBridgeReply(data.chatId, `角色卡导入失败：${error.message}`);
+        }
+        return true;
+    }
+
+    if (command === 'upload_import_preset' || command === 'upload_import_preset_switch') {
+        try {
+            if (!data.upload) throw new Error('Missing upload payload');
+            const name = await importBridgeOpenAIPresetUpload(data.upload, command === 'upload_import_preset_switch');
+            const suffix = command === 'upload_import_preset_switch' ? '\n已切换到该预设。' : '';
+            sendBridgeReply(data.chatId, `已导入 OpenAI 预设：${name}${suffix}`);
+        } catch (error) {
+            console.error('[Telegram Bridge] preset import failed', error);
+            sendBridgeReply(data.chatId, `预设导入失败：${error.message}`);
+        }
+        return true;
+    }
+
+    if (isGenerating && !['models', 'presets', 'profiles', 'providers', 'provider_models', 'provider-models', 'bridge_status'].includes(command)) {
+        sendBridgeReply(data.chatId, '当前正在生成回复，请生成完成后再切换模型、预设或Profile。');
+        return true;
+    }
+    if (command === 'providers') {
+        const providers = getProviderList(config);
+        const buttons = providers.map(p => ({ text: `${p.current ? '✓ ' : ''}${p.label}`, callback_data: `cmd_provider_${p.id}` }));
+        const keyboard = [];
+        for (let i = 0; i < buttons.length; i += 2) keyboard.push(buttons.slice(i, i + 2));
+        keyboard.push([{ text: '🧩 当前源模型', callback_data: 'cmd_provider_models' }, { text: '📊 当前状态', callback_data: 'cmd_bridge_status' }]);
+        const lines = providers.length ? providers.map(p => `${p.index}. ${p.label} (${p.id})${p.current ? ' ← 当前' : ''}`).join('\n') : '(未发现供应商下拉框)';
+        sendBridgeReply(data.chatId, `🔌 连接档案列表\n\n当前源：${oai_settings.chat_completion_source}\n\n${lines}\n\n切换：/provider <ID或序号>`, { inline_keyboard: keyboard });
+        return true;
+    }
+
+    if (command === 'provider') {
+        const arg = args.join(' ');
+        const provider = findProviderByArg(arg, config);
+        if (!provider) {
+            sendBridgeReply(data.chatId, `未找到供应商：${arg}\n请用 /providers 查看当前酒馆已有供应商。`);
+            return true;
+        }
+        await applyProviderProfile(provider, config.selectedProviderSecret);
+        const discovered = discoverCurrentModels();
+        sendBridgeReply(data.chatId, `已切换连接档案：${provider.label} (${provider.source})\nEndpoint：${provider.customUrl || '(当前供应商默认)'}\n当前模型：${getCurrentModelId() || '(未设置)'}\n当前源发现模型数：${discovered.models.length}\n\n查看模型：/provider-models`);
+        return true;
+    }
+
+    if (command === 'provider_models' || command === 'provider-models') {
+        const list = getFilteredCurrentProviderModels(args);
+        const buttons = list.models.map(m => ({ text: `${m.index}. ${m.id === getCurrentModelId() ? '✓ ' : ''}${m.label || m.id}`.slice(0, 60), callback_data: `cmd_provider_model_${m.index}` }));
+        const keyboard = [];
+        for (let i = 0; i < buttons.length; i += 1) keyboard.push([buttons[i]]);
+        const nav = [];
+        if (list.page > 1) nav.push({ text: '⬅️ 上页', callback_data: `cmd_provider_page_${list.page - 1}` });
+        if (list.page < list.totalPages) nav.push({ text: '➡️ 下页', callback_data: `cmd_provider_page_${list.page + 1}` });
+        if (nav.length) keyboard.push(nav);
+        keyboard.push([{ text: '🔌 供应商', callback_data: 'cmd_providers' }, { text: '📊 当前状态', callback_data: 'cmd_bridge_status' }]);
+        const lines = list.models.length ? list.models.map(m => `${m.index}. ${m.id}${m.id === getCurrentModelId() ? ' ← 当前' : ''}`).join('\n') : '(当前供应商未发现模型)';
+        const q = list.query ? `\n搜索：${list.query}` : '';
+        sendBridgeReply(data.chatId, `🧩 当前供应商模型\n\n供应商：${list.source}\n当前模型：${getCurrentModelId() || '(未设置)'}${q}\n页码：${list.page}/${list.totalPages}，共 ${list.total} 个\n\n${lines}\n\n切换：/provider-model <模型ID或序号>`, { inline_keyboard: keyboard });
+        return true;
+    }
+
+    if (command === 'provider_model' || command === 'provider-model') {
+        const arg = args.join(' ');
+        const model = resolveCurrentProviderModelArg(arg, args);
+        if (!model?.id) {
+            sendBridgeReply(data.chatId, `未找到模型：${arg}\n请用 /provider-models 查看当前供应商模型。`);
+            return true;
+        }
+        await switchModelByDefinition({ source: oai_settings.chat_completion_source, model: model.id, label: model.label || model.id });
+        sendBridgeReply(data.chatId, `已切换当前供应商模型：${model.id}\n供应商：${oai_settings.chat_completion_source}\n当前模型：${getCurrentModelId() || '(未设置)'}`);
+        return true;
+    }
+
+    if (command === 'models') {
+        const discovered = discoverCurrentModels();
+        const enabled = getEnabledModelEntries(config);
+        const buttons = enabled.map(([alias, model]) => ({ text: model.label || alias, callback_data: `cmd_model_${alias}` }));
+        const keyboard = [];
+        for (let i = 0; i < buttons.length; i += 2) keyboard.push(buttons.slice(i, i + 2));
+        keyboard.push([{ text: '📊 当前状态', callback_data: 'cmd_bridge_status' }]);
+        const enabledLines = enabled.length ? enabled.map(([alias, model], i) => `${i + 1}. ${alias} — ${model.label || model.model} (${model.model})`).join('\n') : '(无)';
+        const discoveredLines = discovered.models.length ? discovered.models.map((m, i) => `${i + 1}. ${m.id}${m.id === getCurrentModelId() ? ' ← 当前' : ''}`).join('\n') : '(当前源未发现模型下拉列表)';
+        sendBridgeReply(data.chatId, `🤖 模型列表\n\n当前源：${discovered.source}\n当前模型：${getCurrentModelId() || '(未设置)'}\n\n已启用：\n${enabledLines}\n\n当前源发现：\n${discoveredLines}\n\n切换：/model <别名或模型ID>`, { inline_keyboard: keyboard });
+        return true;
+    }
+    if (command === 'model' || /^model_/.test(command)) {
+        const arg = command.startsWith('model_') ? command.replace(/^model_/, '') : args.join(' ');
+        const model = resolveModelArg(arg, config);
+        if (!model) { sendBridgeReply(data.chatId, `未找到或未启用模型：${arg}\n请用 /models 查看可用模型。`); return true; }
+        await switchModelByDefinition(model);
+        sendBridgeReply(data.chatId, `已切换模型：${model.label || model.alias}\n当前源：${oai_settings.chat_completion_source}\n当前模型：${getCurrentModelId()}`);
+        return true;
+    }
+    if (command === 'presets') {
+        const presets = getPresetList();
+        const buttons = presets.map(p => ({ text: p.name, callback_data: `cmd_preset_${p.index}` }));
+        const keyboard = [];
+        for (let i = 0; i < buttons.length; i += 2) keyboard.push(buttons.slice(i, i + 2));
+        keyboard.push([{ text: '📊 当前状态', callback_data: 'cmd_bridge_status' }]);
+        const lines = presets.length ? presets.map(p => `${p.index}. ${p.name}${p.name === oai_settings.preset_settings_openai ? ' ← 当前' : ''}`).join('\n') : '(未发现预设)';
+        sendBridgeReply(data.chatId, `🎛️ 预设列表\n\n当前预设：${oai_settings.preset_settings_openai || '(未设置)'}\n连接绑定：${oai_settings.bind_preset_to_connection ? '开启' : '关闭'}\n\n${lines}\n\n切换：/preset <名称> 或 /preset_数字`, { inline_keyboard: keyboard });
+        return true;
+    }
+    if (command === 'preset' || /^preset_\d+$/.test(command)) {
+        const arg = command.startsWith('preset_') ? command.replace(/^preset_/, '') : args.join(' ');
+        const preset = await switchPresetByNameOrIndex(arg);
+        sendBridgeReply(data.chatId, `已切换预设：${preset.name}\n当前模型：${getCurrentModelId() || '(未设置)'}\n连接绑定：${oai_settings.bind_preset_to_connection ? '开启' : '关闭'}`);
+        return true;
+    }
+    if (command === 'profiles') {
+        const entries = Object.entries(config.profiles || {});
+        const buttons = entries.map(([name, profile]) => ({ text: profile.label || name, callback_data: `cmd_profile_${name}` }));
+        const keyboard = [];
+        for (let i = 0; i < buttons.length; i += 2) keyboard.push(buttons.slice(i, i + 2));
+        keyboard.push([{ text: '📊 当前状态', callback_data: 'cmd_bridge_status' }]);
+        const lines = entries.length ? entries.map(([name, profile], i) => `${i + 1}. ${name} — ${profile.label || name}\n   model=${profile.modelAlias || profile.model || '-'} preset=${profile.preset || '-'}`).join('\n') : '(无)';
+        sendBridgeReply(data.chatId, `⚡ Profile列表\n\n${lines}\n\n切换：/profile <名称>`, { inline_keyboard: keyboard });
+        return true;
+    }
+    if (command === 'profile' || /^profile_/.test(command)) {
+        const name = command.startsWith('profile_') ? command.replace(/^profile_/, '') : args.join(' ');
+        const profile = (config.profiles || {})[name];
+        if (!profile) { sendBridgeReply(data.chatId, `未找到Profile：${name}\n请用 /profiles 查看。`); return true; }
+        let preset = null;
+        if (profile.preset) preset = await switchPresetByNameOrIndex(profile.preset);
+        let modelDef = null;
+        if (profile.modelAlias) modelDef = resolveModelArg(profile.modelAlias, config);
+        else if (profile.model) modelDef = resolveModelArg(profile.model, config) || { source: profile.source, model: profile.model, label: profile.model };
+        if (modelDef) await switchModelByDefinition(modelDef);
+        sendBridgeReply(data.chatId, `已切换Profile：${profile.label || name}\n当前源：${oai_settings.chat_completion_source}\n当前模型：${getCurrentModelId() || '(未设置)'}\n当前预设：${preset?.name || oai_settings.preset_settings_openai || '(未设置)'}`);
+        return true;
+    }
+    if (command === 'bridge_status' || command === 'bridge_reload') {
+        sendBridgeReply(data.chatId, buildStatusText(config));
+        return true;
+    }
+    return false;
+}
 
 // 连接到WebSocket服务器
 function connect() {
@@ -358,6 +948,10 @@ function connect() {
                 let commandSuccess = false;
 
                 try {
+                    if (await handleBridgeControlCommand(data, context)) {
+                        return;
+                    }
+
                     switch (data.command) {
                         case 'new':
                             await doNewChat({ deleteCurrentChat: false });
@@ -386,12 +980,21 @@ function connect() {
                                 });
                                 replyText += `\n切换: /switchchar_数字`;
 
-                                // 发送带分页信息的回复
+                                const charButtons = pageChars.map((char, index) => {
+                                    const globalIndex = startIndex + index + 1;
+                                    const label = `${globalIndex}. ${char.name}`.slice(0, 60);
+                                    return [{ text: label, callback_data: `cmd_switchchar_${globalIndex}` }];
+                                });
+
+                                // 发送带分页和切换按钮的回复
                                 if (ws && ws.readyState === WebSocket.OPEN) {
                                     ws.send(JSON.stringify({
                                         type: 'ai_reply',
                                         chatId: data.chatId,
                                         text: replyText,
+                                        reply_markup: {
+                                            inline_keyboard: charButtons
+                                        },
                                         pagination: {
                                             currentPage,
                                             totalPages,
@@ -452,12 +1055,22 @@ function connect() {
                                 });
                                 replyText += `\n切换: /switchchat_数字`;
 
-                                // 发送带分页信息的回复
+                                const chatButtons = pageChats.map((chat, index) => {
+                                    const globalIndex = chatStartIndex + index + 1;
+                                    let chatName = chat.file_name.replace('.jsonl', '');
+                                    const label = `${globalIndex}. ${chatName}`.slice(0, 60);
+                                    return [{ text: label, callback_data: `cmd_switchchat_${globalIndex}` }];
+                                });
+
+                                // 发送带分页和切换按钮的回复
                                 if (ws && ws.readyState === WebSocket.OPEN) {
                                     ws.send(JSON.stringify({
                                         type: 'ai_reply',
                                         chatId: data.chatId,
                                         text: replyText,
+                                        reply_markup: {
+                                            inline_keyboard: chatButtons
+                                        },
                                         pagination: {
                                             currentPage: chatCurrentPage,
                                             totalPages: chatTotalPages,
