@@ -284,20 +284,30 @@ async function importBridgeOpenAIPresetUpload(upload, switchAfter = false) {
     });
     if (!response.ok) throw new Error(`Preset save failed: HTTP ${response.status}`);
     const data = await response.json();
-    if (switchAfter) {
+
+    // Keep SillyTavern's in-memory preset registry and DOM select in sync immediately.
+    // Otherwise /presets reads stale options until the headless frontend reloads.
+    if (!Object.prototype.hasOwnProperty.call(openai_setting_names, data.name)) {
         openai_settings.push(presetBody);
         openai_setting_names[data.name] = openai_settings.length - 1;
+    }
+    const presetIndex = openai_setting_names[data.name];
+    const select = $('#settings_preset_openai');
+    let option = select.find('option').filter(function () { return $(this).text() === data.name || $(this).val() === String(presetIndex); });
+    if (!option.length) {
+        option = $(`<option></option>`).val(String(presetIndex)).text(data.name);
+        select.append(option);
+    } else {
+        option.val(String(presetIndex)).text(data.name);
+    }
+
+    if (switchAfter) {
         oai_settings.preset_settings_openai = data.name;
-        const option = document.createElement('option');
-        option.selected = true;
-        option.value = String(openai_settings.length - 1);
-        option.innerText = data.name;
-        $('#settings_preset_openai').append(option).trigger('change');
+        select.val(String(presetIndex)).trigger('change');
         saveSettingsDebounced();
     }
     return data.name;
 }
-
 
 function getCurrentModelSelector(source = oai_settings.chat_completion_source) {
     const map = {
