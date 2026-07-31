@@ -42,8 +42,15 @@ const DEFAULT_SETTINGS = Object.freeze({
     bufferWindowSeconds: 30,         // 缓冲模式：收集窗口（秒）
     bufferMaxMessages: 8,            // 缓冲模式：最多收集消息数，达到立即触发
     // ---- 真实对话行为 ----
+
     mergeWindowSeconds: 3,           // 即时模式：连续消息合并窗口（秒），0 = 每条消息立即回复
+
     syncLocalToTelegram: true,       // 酒馆本地生成的 AI 回复也推送到最近活跃的 Telegram 聊天
+
+    // ---- 上下文隔离 ----
+
+    perChatContext: true,            // 每个 TG 聊天独立酒馆上下文（独立角色/聊天记录），防止多群/私聊串上下文
+
 });
 
 let ws = null; // WebSocket实例
@@ -57,8 +64,128 @@ let isGenerating = false;
 let messageQueue = [];
 
 // 缓冲模式：收集一段时间内多名玩家的消息，合并成一条发送给 AI
+
 // 元素: { chatId, parts: [string], timer, lastActivity }
+
 let buffer = null;
+
+
+
+// --- 每聊天独立上下文（防止多群/私聊串上下文） ---
+
+// Telegram chatId -> { characterId: number|null, chatName: string }
+
+const chatBindings = new Map();
+
+
+
+/** 生成该 TG 聊天专用的酒馆聊天文件名 */
+
+function tgChatName(chatId) {
+
+    const n = Math.abs(Number(chatId) || 0);
+
+    return `tg_${n}`;
+
+}
+
+
+
+/** 获取（不存在则创建）某 TG 聊天的上下文绑定 */
+
+function getOrCreateBinding(chatId) {
+
+    let binding = chatBindings.get(chatId);
+
+    if (!binding) {
+
+        binding = { characterId: null, chatName: tgChatName(chatId) };
+
+        chatBindings.set(chatId, binding);
+
+    }
+
+    return binding;
+
+}
+
+
+
+/**
+
+ * 确保酒馆当前处于该 TG 聊天绑定的角色 + 聊天记录（独立上下文）。
+
+ * 聊天记录不存在时自动新建并重命名为 tg_<chatId>。
+
+ * @returns {Promise<boolean>} 是否就绪
+
+ */
+
+async function ensureChatBinding(chatId) {
+
+    if (!getSettings().perChatContext) return true;
+
+    const context = SillyTavern.getContext();
+
+    const binding = getOrCreateBinding(chatId);
+
+
+
+    try {
+
+        // 1. 确保有角色可选
+
+        if (context.characterId === undefined || context.characterId === null) {
+
+            await context.selectCharacterById(0);
+
+        }
+
+        // 2. 切换角色（绑定过角色的聊天）
+
+        if (binding.characterId != null && binding.characterId >= 0 && context.characterId !== binding.characterId) {
+
+            await context.selectCharacterById(binding.characterId);
+
+        }
+
+        // 3. 确保打开的是该聊天绑定的聊天记录
+
+        if (context.chatId !== binding.chatName) {
+
+            const chats = await getPastCharacterChats(context.characterId);
+
+            const exists = Array.isArray(chats) && chats.some(c => c.file_name === `${binding.chatName}.jsonl`);
+
+            if (exists) {
+
+                await context.openCharacterChat(binding.chatName);
+
+            } else {
+
+                // 不存在：新建并重命名为绑定名
+
+                await doNewChat({ deleteCurrentChat: false });
+
+                const newChatId = context.getCurrentChatId();
+
+                await context.renameChat(newChatId, binding.chatName);
+
+            }
+
+        }
+
+        return true;
+
+    } catch (error) {
+
+        console.error(`[Telegram Bridge] 切换独立聊天上下文失败 (chatId=${chatId}):`, error);
+
+        return false;
+
+    }
+
+}
 
 // 心跳超时检测相关变量
 let heartbeatTimeoutTimer = null;
@@ -910,10 +1037,47 @@ function flushMergeBuffer() {
  * @param {object} item - { chatId, text, username, isGroup }
  */
 async function processMessage(item) {
+
+    // 标记开始生成（先置位，防止 ensure 异步期间的并发）
+
+    isGenerating = true;
+
+
+
+    // 0. 确保该 TG 聊天处于独立的酒馆上下文（角色 + 聊天记录），防止多群/私聊串上下文
+
+    if (getSettings().perChatContext) {
+
+        const ready = await ensureChatBinding(item.chatId);
+
+        if (!ready) {
+
+            isGenerating = false;
+
+            if (ws && ws.readyState === WebSocket.OPEN) {
+
+                ws.send(JSON.stringify({ type: 'error_message', chatId: item.chatId, text: '切换到独立聊天上下文失败，请稍后重试。' }));
+
+            }
+
+            setTimeout(processNextFromQueue, 200);
+
+            return;
+
+        }
+
+    }
+
+
+
     const { eventSource, event_types, generate } = SillyTavern.getContext();
 
-    // 标记开始生成
+
+
+    // 切换聊天可能触发 CHAT_CHANGED 重置了标志，这里重新置位
+
     isGenerating = true;
+
     lastProcessedChatId = item.chatId;
 
     // 1. 立即向Telegram发送"输入中"状态
@@ -1223,9 +1387,15 @@ async function connect() {
 
                     switch (data.command) {
                         case 'new':
+
                             await doNewChat({ deleteCurrentChat: false });
+
+                            getOrCreateBinding(data.chatId).chatName = context.getCurrentChatId(); // 绑定到该 TG 聊天
+
                             replyText = '新的聊天已经开始。';
+
                             commandSuccess = true;
+
                             break;
                         case 'listchars': {
                             const characters = context.characters.slice(1);
@@ -1288,11 +1458,19 @@ async function connect() {
                             const targetChar = characters.find(c => c.name === targetName);
 
                             if (targetChar) {
+
                                 const charIndex = characters.indexOf(targetChar);
+
                                 await context.selectCharacterById(charIndex);
+
+                                getOrCreateBinding(data.chatId).characterId = charIndex; // 绑定到该 TG 聊天
+
                                 commandSuccess = true;
+
                                 await sendChatSelectionForCharacter(charIndex, `已成功切换到角色 "${targetName}"。
+
 请选择聊天记录，或新建聊天：`);
+
                                 return;
                             } else {
                                 replyText = `角色 "${targetName}" 未找到。`;
@@ -1314,9 +1492,15 @@ async function connect() {
                                 break;
                             }
                             const targetChatFile = `${data.args.join(' ')}`;
+
                             try {
+
                                 await context.openCharacterChat(targetChatFile);
+
+                                getOrCreateBinding(data.chatId).chatName = targetChatFile.replace(/\.jsonl$/, ''); // 绑定到该 TG 聊天
+
                                 replyText = `已加载聊天记录： ${targetChatFile}`;
+
                                 commandSuccess = true;
                             } catch (err) {
                                 console.error(err);
@@ -1331,12 +1515,21 @@ async function connect() {
                                 const index = parseInt(charMatch[1]) - 1;
                                 const characters = context.characters.slice(1);
                                 if (index >= 0 && index < characters.length) {
+
                                     const targetChar = characters[index];
+
                                     const charIndex = context.characters.indexOf(targetChar);
+
                                     await context.selectCharacterById(charIndex);
+
+                                    getOrCreateBinding(data.chatId).characterId = charIndex; // 绑定到该 TG 聊天
+
                                     commandSuccess = true;
+
                                     await sendChatSelectionForCharacter(charIndex, `已切换到角色 "${targetChar.name}"。
+
 请选择聊天记录，或新建聊天：`);
+
                                     return;
                                 } else {
                                     replyText = `无效的角色序号: ${index + 1}。请使用 /listchars 查看可用角色。`;
@@ -1357,12 +1550,21 @@ async function connect() {
                                     const targetChat = chatFiles[index];
                                     const chatName = targetChat.file_name.replace('.jsonl', '');
                                     try {
+
                                         await context.openCharacterChat(chatName);
+
+                                        getOrCreateBinding(data.chatId).chatName = chatName; // 绑定到该 TG 聊天
+
                                         replyText = `已加载聊天记录： ${chatName}`;
+
                                         commandSuccess = true;
+
                                     } catch (err) {
+
                                         console.error(err);
+
                                         replyText = `加载聊天记录失败。`;
+
                                     }
                                 } else {
                                     replyText = `无效的聊天记录序号: ${index + 1}。请使用 /listchats 查看可用聊天记录。`;
@@ -1682,6 +1884,10 @@ function bindSettingsUI() {
     $('#telegram_buffer_max').val(settings.bufferMaxMessages);
     $('#telegram_sync_local').prop('checked', settings.syncLocalToTelegram);
 
+    $('#telegram_per_chat_context').prop('checked', settings.perChatContext);
+
+
+
     $('#telegram_bridge_url').on('input', () => {
         getSettings().bridgeUrl = $('#telegram_bridge_url').val();
         saveSettingsDebounced();
@@ -1742,6 +1948,13 @@ function bindSettingsUI() {
     $('#telegram_sync_local').on('change', function () {
         getSettings().syncLocalToTelegram = $(this).prop('checked');
         console.log(`[Telegram Bridge] 双向同步: ${getSettings().syncLocalToTelegram ? '开启' : '关闭'}`);
+        saveSettingsDebounced();
+    });
+
+    $('#telegram_per_chat_context').on('change', function () {
+        getSettings().perChatContext = $(this).prop('checked');
+        console.log(`[Telegram Bridge] 独立上下文: ${getSettings().perChatContext ? '开启' : '关闭'}`);
+        if (getSettings().perChatContext) chatBindings.clear(); // 重新初始化绑定
         saveSettingsDebounced();
     });
 
