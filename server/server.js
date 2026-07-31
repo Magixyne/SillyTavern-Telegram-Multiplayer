@@ -422,6 +422,7 @@ const wss = new WebSocket.Server({ port: wssPort });
 logWithTimestamp('log', `WebSocket服务器正在监听端口 ${wssPort}...`);
 
 let sillyTavernClient = null; // 用于存储连接的SillyTavern扩展客户端
+let lastActiveChatId = null; // 最近活跃的Telegram聊天（用于酒馆本地生成的双向同步）
 
 // 心跳定时器
 let heartbeatInterval = null;
@@ -1131,6 +1132,18 @@ wss.on('connection', ws => {
                 logWithTimestamp('log', `显示"输入中"状态给Telegram用户 ${data.chatId}`);
                 bot.sendChatAction(data.chatId, 'typing').catch(error =>
                     logWithTimestamp('error', '发送"输入中"状态失败:', error));
+            } else if (data.type === 'local_reply') {
+                // 酒馆本地生成的 AI 回复 → 推送到最近活跃的 Telegram 聊天（双向同步）
+                if (!lastActiveChatId) {
+                    logWithTimestamp('log', '收到本地生成同步请求，但没有活跃的 Telegram 聊天，已忽略。');
+                } else {
+                    logWithTimestamp('log', `酒馆本地生成同步 → chatId ${lastActiveChatId}`);
+                    const formatConfig = config.messageFormat || {};
+                    const formatted = MessageFormatter.format(data.text || '', formatConfig);
+                    const sendOptions = {};
+                    if (formatted.parseMode) sendOptions.parse_mode = formatted.parseMode;
+                    await sendLongMessage(bot, lastActiveChatId, formatted.text, sendOptions);
+                }
             } else if (data.type === 'command_executed') {
                 // 处理前端命令执行结果
                 logWithTimestamp('log', `命令 ${data.command} 执行完成，结果: ${data.success ? '成功' : '失败'}`);
@@ -1216,6 +1229,7 @@ bot.on('callback_query', async (callbackQuery) => {
     const chatId = callbackQuery.message.chat.id;
     const userId = callbackQuery.from.id;
     const data = callbackQuery.data;
+    lastActiveChatId = chatId; // 记录最近活跃的聊天（本地生成双向同步用）
 
     logWithTimestamp('log', `收到按钮回调: ${data}, 用户: ${userId}`);
 
@@ -1287,6 +1301,7 @@ bot.on('message', (msg) => {
     const text = msg.text;
 
     const userId = msg.from.id;
+    lastActiveChatId = chatId; // 记录最近活跃的聊天（本地生成双向同步用）
 
     // 优先使用用户名，其次显示名，用于 Multiplayer 群组模式的前缀
 

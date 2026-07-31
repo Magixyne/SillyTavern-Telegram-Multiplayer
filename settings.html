@@ -6,10 +6,30 @@
         </div>
         <div class="inline-drawer-content">
 
+            <!-- 内置 Server（酒馆 Server 插件） -->
+            <div class="telegram-connector_block">
+                <b>🚀 内置 Server（酒馆插件模式）</b>
+                <small style="display:block; margin-top:4px; opacity:0.7;">
+                    将仓库 <code>plugins/telegram-bridge</code> 目录放入酒馆 <code>plugins/</code> 目录并在 config.yaml 启用 server 插件后，这里可直接管理 Bot。
+                </small>
+                <div style="margin-top:6px;">
+                    <input type="text" id="telegram_bot_token" class="text_pole" placeholder="Telegram Bot Token（如 123456:ABC...）" style="width:100%;">
+                    <div style="margin-top:6px; display:flex; gap:6px; flex-wrap:wrap;">
+                        <input id="telegram_token_save" class="menu_button" type="button" value="保存 Token" />
+                        <input id="telegram_server_start" class="menu_button" type="button" value="启动" />
+                        <input id="telegram_server_stop" class="menu_button" type="button" value="停止" />
+                        <input id="telegram_server_refresh" class="menu_button" type="button" value="刷新状态" />
+                    </div>
+                    <div id="telegram_server_status" style="margin-top:6px; font-size: 0.9em; opacity:0.85;">检测中...</div>
+                </div>
+            </div>
+
+            <hr class="sysHR" />
+
             <!-- 基础连接设置 -->
             <div class="telegram-connector_block flex-container">
-                <label for="telegram_bridge_url">Bridge 服务器 WebSocket URL</label>
-                <input type="text" id="telegram_bridge_url" class="text_pole" placeholder="例如：ws://127.0.0.1:8080">
+                <label for="telegram_bridge_url">Bridge URL（留空 = 自动探测内置 Server）</label>
+                <input type="text" id="telegram_bridge_url" class="text_pole" placeholder="留空自动，或填写 ws://127.0.0.1:2333">
                 <div id="telegram_connection_status" style="margin-top: 10px; font-weight: bold;">状态： 请点击连接按钮</div>
             </div>
 
@@ -57,6 +77,12 @@
             </div>
 
             <div class="telegram-connector_block flex-container">
+                <label for="telegram_merge_window">连续消息合并窗口（秒，0=每条立即回复）</label>
+                <input type="number" id="telegram_merge_window" class="text_pole" min="0" max="60" value="3">
+                <small style="opacity:0.7;">玩家连续发多条消息时合并成一条再回复，更接近真实聊天</small>
+            </div>
+
+            <div class="telegram-connector_block flex-container">
                 <label for="telegram_buffer_window">缓冲窗口（秒）</label>
                 <input type="number" id="telegram_buffer_window" class="text_pole" min="1" max="300" value="30">
             </div>
@@ -66,13 +92,21 @@
                 <input type="number" id="telegram_buffer_max" class="text_pole" min="1" max="50" value="8">
             </div>
 
+            <div class="telegram-connector_block flex-container">
+                <label class="checkbox_label" for="telegram_sync_local">
+                    <input type="checkbox" id="telegram_sync_local">
+                    <span>双向同步：酒馆本地生成的 AI 回复也推送到 Telegram</span>
+                </label>
+            </div>
+
             <hr class="sysHR" />
             <small style="opacity:0.6; display:block;">
                 💡 使用提示：<br>
-                · 将机器人拉入群组并设置为管理员，玩家在群内发言即可与 AI 互动。<br>
-                · 即时模式：每条玩家消息都会触发 AI 回复（生成中收到的消息会自动排队）。<br>
-                · 缓冲模式：适合多人轮流行动的 RPG 场景，玩家消息会合并成一条交给 AI，避免刷屏。<br>
-                · 私聊中不会添加玩家名前缀，行为与普通模式一致。
+                · <b>内置 Server 模式（推荐）</b>：装好 server 插件后，这里填 Token → 保存 → 启动 → 连接，URL 留空自动探测端口。<br>
+                · 或独立部署 <code>server/</code> 目录，Bridge URL 填 <code>ws://服务器IP:2333</code>。<br>
+                · 即时模式 + 合并窗口：玩家连续输入时 AI 不会逐条回复，攒一波再回。<br>
+                · 缓冲模式：适合多人轮流行动的 RPG 场景。<br>
+                · 私聊消息在酒馆中会显示 Telegram 用户名作为来源。
             </small>
         </div>
     </div>
