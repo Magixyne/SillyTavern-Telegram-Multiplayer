@@ -992,12 +992,25 @@ async function loadSettingsUI() {
     const versionBadge = `<div style="font-size:0.85em; opacity:0.55; padding:2px 0 4px;">Telegram Connector v${extVersion}</div>`;
     settingsHtml = versionBadge + settingsHtml;
 
-    $('#extensions_settings').append(settingsHtml);
-    console.log('[Telegram Bridge] 设置 UI 已添加。');
+    // 官方文档（Writing-Extensions）推荐的扩展设置挂载容器是 #extensions_settings2
+    // 兼容回退：#extensions_settings（旧容器，部分 ST 版本/主题可能仍在使用）
+    let settingsContainer = $('#extensions_settings2');
+    if (settingsContainer.length === 0) {
+        settingsContainer = $('#extensions_settings');
+    }
+    if (settingsContainer.length === 0) {
+        console.error('[Telegram Bridge] 找不到扩展设置容器(#extensions_settings2 / #extensions_settings)');
+        return;
+    }
+
+    settingsContainer.append(settingsHtml);
+    console.log(`[Telegram Bridge] 设置 UI 已添加到容器 #${settingsContainer.attr('id')}`);
 
     bindSettingsUI();
 
-    // 自检：确认关键控件是否渲染成功（Multiplayer / 内置Server / 合并窗口）
+    // 自检：确认 settings.html 文件内容与关键控件是否渲染（用于定位"界面旧/缺选项"问题）
+    console.log('[Telegram Bridge] 自检 → settings.html 内容长度:', settingsHtml.length, '(新版约 6.5KB+)');
+    console.log('[Telegram Bridge] 自检 → settings.html 含 Multiplayer 控件:', settingsHtml.includes('telegram_multiplayer_enabled'));
     console.log('[Telegram Bridge] 自检 → Multiplayer 选项:', $('#telegram_multiplayer_enabled').length > 0 ? '存在 ✅' : '缺失 ❌');
     console.log('[Telegram Bridge] 自检 → 内置Server区块:', $('#telegram_server_start').length > 0 ? '存在 ✅' : '缺失 ❌');
     console.log('[Telegram Bridge] 自检 → 合并窗口:', $('#telegram_merge_window').length > 0 ? '存在 ✅' : '缺失 ❌');
