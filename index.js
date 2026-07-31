@@ -84,11 +84,13 @@ function updateStatus(message, color) {
 
 /**
  * 根据设置的用户名前缀格式，为群组消息添加玩家名前缀
- * @param {string} username - Telegram 用户名
- * @param {string} text - 原始消息文本
+ * @param {object} item - { username, firstName, text }
  * @returns {string} 添加前缀后的文本
  */
-function applyUserPrefix(username, text) {
+function applyUserPrefix(item) {
+    const username = item.username;
+    const firstName = item.firstName;
+    const text = item.text;
     // 防御：过滤空值及 "null"/"undefined" 字符串，避免出现 "null: xxx" 的异常前缀
     if (!username || username === 'null' || username === 'undefined') return text;
     const format = getSettings().userPrefix || '<用户>: ';
@@ -100,6 +102,12 @@ function applyUserPrefix(username, text) {
             return `[${displayName}]: ${text}`;
         case '*用户* ':
             return `*${displayName}* ${text}`;
+        case '名字 (@用户): ':
+            // 例: Lin Verse (@lolinverse): 消息
+            if (firstName && firstName !== displayName) {
+                return `${firstName} (@${displayName}): ${text}`;
+            }
+            return `@${displayName}: ${text}`;
         case '<用户>: ':
         default:
             return `<${displayName}>: ${text}`;
@@ -232,7 +240,7 @@ function addToBuffer(item) {
         if (buffer) flushBuffer();
         buffer = { chatId: item.chatId, parts: [], timer: null };
     }
-    const prefixed = item.isGroup ? applyUserPrefix(item.username, item.text) : item.text;
+    const prefixed = item.isGroup ? applyUserPrefix(item) : item.text;
     buffer.parts.push(prefixed);
     buffer.lastActivity = Date.now();
     console.log(`[Telegram Bridge] 缓冲消息 (${buffer.parts.length}/${getSettings().bufferMaxMessages})，来自: ${item.username || '未知用户'}`);
@@ -284,7 +292,7 @@ function flushMergeBuffer() {
     const settings = getSettings();
     const lines = b.parts.map(p => {
         if (p.isGroup && settings.multiplayerEnabled && p.username) {
-            return applyUserPrefix(p.username, p.text);
+            return applyUserPrefix(p);
         }
         return p.text;
     });
@@ -316,7 +324,7 @@ async function processMessage(item) {
     let messageAuthorName = null;
     if (item.isGroup) {
         if (item.username && getSettings().multiplayerEnabled) {
-            messageText = applyUserPrefix(item.username, item.text);
+            messageText = applyUserPrefix(item);
         }
     } else if (item.username && item.username !== 'null' && item.username !== 'undefined') {
         messageAuthorName = item.username;
@@ -497,6 +505,7 @@ async function connect() {
                     chatId: data.chatId,
                     text: data.text,
                     username: data.username || null,
+                    firstName: data.firstName || null,
                     isGroup: data.isGroup === true,
                 };
 
