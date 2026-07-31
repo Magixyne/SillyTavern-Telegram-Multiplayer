@@ -1,4 +1,4 @@
-<div class="telegram-connector_settings">
+<div class="telegram-multiplier_settings">
     <div class="inline-drawer">
         <div class="inline-drawer-toggle inline-drawer-header">
             <b>Telegram MultiPlayer 设置</b>
@@ -27,7 +27,7 @@
             <hr class="sysHR" />
 
             <!-- 基础连接设置 -->
-            <div class="telegram-connector_block flex-container">
+            <div class="telegram-connector_block">
                 <label for="telegram_bridge_url">Bridge URL（留空 = 自动探测内置 Server）</label>
                 <input type="text" id="telegram_bridge_url" class="text_pole" placeholder="留空自动，或填写 ws://127.0.0.1:2333">
                 <div id="telegram_connection_status" style="margin-top: 10px; font-weight: bold;">状态： 请点击连接按钮</div>
@@ -38,27 +38,23 @@
                 <input id="telegram_disconnect_button" class="menu_button" type="button" value="断开" />
             </div>
 
-            <div class="telegram-connector_block flex-container">
-                <label class="checkbox_label" for="telegram_auto_connect">
-                    <input type="checkbox" id="telegram_auto_connect">
-                    <span>页面加载时自动连接</span>
-                </label>
-            </div>
+            <label class="checkbox_label margin-bot-10px" for="telegram_auto_connect">
+                <input id="telegram_auto_connect" type="checkbox" class="checkbox">
+                <span>页面加载时自动连接</span>
+            </label>
 
             <hr class="sysHR" />
 
             <!-- Multiplayer 群组模式设置 -->
-            <div class="telegram-connector_block">
-                <label class="checkbox_label" for="telegram_multiplayer_enabled">
-                    <input type="checkbox" id="telegram_multiplayer_enabled">
-                    <span><b>Multiplayer 模式（Telegram 群组）</b></span>
-                </label>
-                <small style="display:block; margin-top:4px; opacity:0.7;">
-                    群组内多名玩家可与同一 AI 角色进行多人角色扮演。启用后，AI 将看到每条消息对应的玩家名。
-                </small>
-            </div>
+            <label class="checkbox_label margin-bot-10px" for="telegram_multiplayer_enabled">
+                <input id="telegram_multiplayer_enabled" type="checkbox" class="checkbox">
+                <span><b>Multiplayer 模式（Telegram 群组）</b></span>
+            </label>
+            <small style="display:block; margin-bottom:10px; opacity:0.7;">
+                群组内多名玩家可与同一 AI 角色进行多人角色扮演。启用后，AI 将看到每条消息对应的玩家名。
+            </small>
 
-            <div class="telegram-connector_block flex-container">
+            <div class="telegram-connector_block">
                 <label for="telegram_user_prefix">玩家消息前缀格式</label>
                 <select id="telegram_user_prefix" class="text_pole">
                     <option value="名字 (@用户): ">名字 (@用户名): </option>
@@ -69,7 +65,7 @@
                 </select>
             </div>
 
-            <div class="telegram-connector_block flex-container">
+            <div class="telegram-connector_block">
                 <label for="telegram_default_mode">默认游戏模式</label>
                 <select id="telegram_default_mode" class="text_pole">
                     <option value="instant">即时模式 - 每条消息立即触发 AI 回复</option>
@@ -77,28 +73,26 @@
                 </select>
             </div>
 
-            <div class="telegram-connector_block flex-container">
+            <div class="telegram-connector_block">
                 <label for="telegram_merge_window">连续消息合并窗口（秒，0=每条立即回复）</label>
                 <input type="number" id="telegram_merge_window" class="text_pole" min="0" max="60" value="3">
                 <small style="opacity:0.7;">玩家连续发多条消息时合并成一条再回复，更接近真实聊天</small>
             </div>
 
-            <div class="telegram-connector_block flex-container">
+            <div class="telegram-connector_block">
                 <label for="telegram_buffer_window">缓冲窗口（秒）</label>
                 <input type="number" id="telegram_buffer_window" class="text_pole" min="1" max="300" value="30">
             </div>
 
-            <div class="telegram-connector_block flex-container">
+            <div class="telegram-connector_block">
                 <label for="telegram_buffer_max">缓冲最大消息数</label>
                 <input type="number" id="telegram_buffer_max" class="text_pole" min="1" max="50" value="8">
             </div>
 
-            <div class="telegram-connector_block flex-container">
-                <label class="checkbox_label" for="telegram_sync_local">
-                    <input type="checkbox" id="telegram_sync_local">
-                    <span>双向同步：酒馆本地生成的 AI 回复也推送到 Telegram</span>
-                </label>
-            </div>
+            <label class="checkbox_label" for="telegram_sync_local">
+                <input id="telegram_sync_local" type="checkbox" class="checkbox">
+                <span>双向同步：酒馆本地生成的 AI 回复也推送到 Telegram</span>
+            </label>
 
             <hr class="sysHR" />
             <small style="opacity:0.6; display:block;">
