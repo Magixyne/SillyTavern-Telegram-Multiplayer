@@ -941,31 +941,66 @@ async function loadSettingsUI() {
     console.log('[Telegram Bridge] 正在尝试加载设置 UI...');
     const { renderExtensionTemplateAsync } = SillyTavern.getContext();
 
-    // 从自身模块 URL 推导扩展文件夹名（兼容第三方目录与用户级安装）
-    let settingsHtml = null;
+    // 读取扩展版本（manifest.json），用于面板显示版本徽标 + 缓存穿透参数
+    let extVersion = 'unknown';
     try {
-        const url = new URL('.', import.meta.url).href;
-        const match = url.match(/\/scripts\/extensions\/(.+?)\/$/);
-        if (match && renderExtensionTemplateAsync) {
-            const folder = match[1];
-            console.log(`[Telegram Bridge] 扩展文件夹: ${folder}`);
-            settingsHtml = await renderExtensionTemplateAsync(folder, 'settings');
+        const manifestUrl = new URL('manifest.json', import.meta.url).href;
+        const manifestResp = await fetch(manifestUrl, { cache: 'no-store' });
+        if (manifestResp.ok) {
+            const manifest = await manifestResp.json();
+            extVersion = manifest.version || 'unknown';
         }
     } catch (error) {
-        console.warn('[Telegram Bridge] renderExtensionTemplateAsync 失败，尝试直接加载:', error);
+        console.warn('[Telegram Bridge] 读取 manifest.json 失败:', error);
+    }
+    console.log(`[Telegram Bridge] 扩展版本: v${extVersion}`);
+
+    // 主路径：直接 fetch settings.html（带 no-store + 版本/时间戳参数，强制绕过缓存，
+    // 避免更新文件后浏览器仍加载旧的设置面板）
+    let settingsHtml = null;
+    try {
+        const settingsUrl = new URL('settings.html', import.meta.url).href;
+        const response = await fetch(`${settingsUrl}?v=${extVersion}&t=${Date.now()}`, { cache: 'no-store' });
+        if (response.ok) {
+            settingsHtml = await response.text();
+        }
+    } catch (error) {
+        console.warn('[Telegram Bridge] 直接加载 settings.html 失败:', error);
     }
 
-    // 回退：直接 fetch settings.html
+    // 回退：renderExtensionTemplateAsync（从自身模块 URL 推导扩展文件夹名）
     if (!settingsHtml) {
-        const settingsUrl = new URL('settings.html', import.meta.url).href;
-        const response = await fetch(settingsUrl);
-        settingsHtml = await response.text();
+        try {
+            const url = new URL('.', import.meta.url).href;
+            const match = url.match(/\/scripts\/extensions\/(.+?)\/$/);
+            if (match && renderExtensionTemplateAsync) {
+                const folder = match[1];
+                console.log(`[Telegram Bridge] 扩展文件夹: ${folder}`);
+                settingsHtml = await renderExtensionTemplateAsync(folder, 'settings');
+            }
+        } catch (error) {
+            console.warn('[Telegram Bridge] renderExtensionTemplateAsync 失败:', error);
+        }
     }
+
+    if (!settingsHtml) {
+        console.error('[Telegram Bridge] 设置面板加载失败（主路径与回退均失败）');
+        return;
+    }
+
+    // 面板顶部注入版本徽标，一眼可确认运行版本
+    const versionBadge = `<div style="font-size:0.85em; opacity:0.55; padding:2px 0 4px;">Telegram Connector v${extVersion}</div>`;
+    settingsHtml = versionBadge + settingsHtml;
 
     $('#extensions_settings').append(settingsHtml);
     console.log('[Telegram Bridge] 设置 UI 已添加。');
 
     bindSettingsUI();
+
+    // 自检：确认关键控件是否渲染成功（Multiplayer / 内置Server / 合并窗口）
+    console.log('[Telegram Bridge] 自检 → Multiplayer 选项:', $('#telegram_multiplayer_enabled').length > 0 ? '存在 ✅' : '缺失 ❌');
+    console.log('[Telegram Bridge] 自检 → 内置Server区块:', $('#telegram_server_start').length > 0 ? '存在 ✅' : '缺失 ❌');
+    console.log('[Telegram Bridge] 自检 → 合并窗口:', $('#telegram_merge_window').length > 0 ? '存在 ✅' : '缺失 ❌');
 }
 
 function bindSettingsUI() {
