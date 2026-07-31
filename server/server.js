@@ -761,9 +761,9 @@ async function handleTelegramCommand(command, args, chatId) {
         return;
     }
 
-    // 检查SillyTavern是否连接
+    // 检查SillyTavern是否连接（未连接时只在终端提示，不向 Telegram 回复，避免群聊刷屏）
     if (!sillyTavernClient || sillyTavernClient.readyState !== WebSocket.OPEN) {
-        sendLongMessage(bot, chatId, 'SillyTavern未连接，无法执行角色和聊天相关命令。请先确保SillyTavern已打开并启用了Telegram扩展。');
+        logWithTimestamp('warn', `命令 /${command} 被忽略：SillyTavern扩展未连接（chatId: ${chatId}）`);
         return;
     }
 
@@ -1425,9 +1425,11 @@ bot.on('message', (msg) => {
 
     } else {
 
-        logWithTimestamp('warn', '收到Telegram消息，但SillyTavern扩展未连接。');
+        // SillyTavern 未连接：只在终端提示，不向 Telegram 回复，避免群聊刷屏
 
-        bot.sendMessage(chatId, '抱歉，我现在无法连接到SillyTavern。请确保SillyTavern已打开并启用了Telegram扩展。');
+        logWithTimestamp('warn', `收到来自 ${chatId} 的消息，但SillyTavern扩展未连接，消息已被忽略: "${text.slice(0, 80)}"`);
+
+        logWithTimestamp('warn', '提示：请在SillyTavern扩展中开启并连接 Telegram 扩展。');
 
     }
 
