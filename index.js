@@ -1,5 +1,5 @@
 // index.js
-// SillyTavern Telegram Connector (Multiplayer)
+// SillyTavern Telegram MultiPlayer
 //
 // 合规性说明（依据官方 Writing-Extensions 文档）：
 // - 使用 SillyTavern.getContext() 获取稳定 API（eventSource、extensionSettings 等）
@@ -989,7 +989,7 @@ async function loadSettingsUI() {
     }
 
     // 面板顶部注入版本徽标，一眼可确认运行版本
-    const versionBadge = `<div style="font-size:0.85em; opacity:0.55; padding:2px 0 4px;">Telegram Connector v${extVersion}</div>`;
+    const versionBadge = `<div style="font-size:0.85em; opacity:0.55; padding:2px 0 4px;">Telegram MultiPlayer v${extVersion}</div>`;
     settingsHtml = versionBadge + settingsHtml;
 
     // 官方文档（Writing-Extensions）推荐的扩展设置挂载容器是 #extensions_settings2
