@@ -23,44 +23,60 @@
 
 在 SillyTavern 中：Extensions → Install Extension → 输入 `https://github.com/justhil/SillyTavern-Telegram-Multiplayer`
 
-### 2. 部署服务器
+### 2. 部署 Bridge（二选一）
 
-#### Docker 部署（推荐）
+#### 模式 A：内置 Server（推荐，无需单独部署）
 
-```bash
-cd server
-# 创建 config.js，参考 config.example.js
-cp config.example.js config.js
-# 编辑 config.js，填入 Bot Token
-docker-compose up -d
-```
+不用单独维护 server 进程，把仓库里的 `plugins/telegram-bridge` 目录复制到酒馆 `plugins/` 目录，酒馆启动即自动运行：
 
-#### 手动部署
+1. 复制 `plugins/telegram-bridge` → 酒馆根目录的 `plugins/` 下（与 `server.js` 同级）
+2. 编辑酒馆 `config.yaml`，确认 `enableServerPlugins: true`
+3. 重启酒馆
+4. 酒馆 → Extensions → Telegram Connector 设置面板：
+   - 填 Bot Token → **保存 Token** → **启动**
+   - Bridge URL **留空**（自动探测内置 Server 并获取空闲端口）→ 点**连接**
+
+> 内置 Server 零额外依赖（用酒馆自带的 ws + 原生 https 实现 Telegram API），
+> 自动选取空闲端口（首选 2333，占用自动递增），详见 `plugins/telegram-bridge/README.md`。
+
+#### 模式 B：独立部署
 
 ```bash
 cd server
 npm install
 cp config.example.js config.js
-# 编辑 config.js，填入 Bot Token
+# 编辑 config.js，填入 Bot Token（或留空，运行时会提示在控制台输入）
 node server.js
+```
+
+Docker：
+
+```bash
+cd server
+cp config.example.js config.js
+docker-compose up -d
 ```
 
 ### 3. 连接
 
 1. SillyTavern → Extensions → Telegram Connector
-2. 填入 Bridge URL：`ws://服务器IP:2333` 或 `wss://域名/tg-bridge`
-3. 点击连接
+2. 模式 A：URL 留空自动连接；模式 B：填 `ws://服务器IP:2333`
+3. 点击连接（开启"自动连接"则页面加载即连）
 
 ## 🎭 Multiplayer 群组模式
 
 1. 在 SillyTavern 扩展设置中勾选 **「Multiplayer 模式」**
 2. 选择玩家消息前缀格式（`<玩家名>: ` / `玩家名: ` / `[玩家名]: ` / `*玩家名* `）
 3. 选择默认游戏模式：
-   - **即时模式**：每条玩家消息立即触发 AI 回复；AI 生成期间收到的消息自动排队，回复完成后按序处理
+   - **即时模式**：玩家消息触发 AI 回复；连续短消息在**合并窗口**（默认 3 秒）内自动合并，不会逐条回复
    - **缓冲模式**：在缓冲窗口（默认 30 秒）内收集所有玩家的消息，合并成一条交给 AI 后统一回复，适合多人轮流行动
 4. 将机器人拉入群组（建议设为管理员），玩家在群内发言即可与 AI 互动
 
-> 私聊中不会添加玩家名前缀，行为与普通模式一致。
+## 💬 真实对话行为
+
+- **私聊来源标识**：私聊消息注入酒馆时会显示 Telegram 用户名作为来源，不再被当作酒馆终端用户发的
+- **连续消息合并**：即时模式下玩家连续发多条短消息会合并成一条再回复（合并窗口可配置，0 = 每条立即回复）
+- **双向同步**：酒馆本地生成的 AI 回复也会推送到最近活跃的 Telegram 聊天，酒馆和 Telegram 的剧情互相可见（可在设置中关闭）
 
 ## 命令
 

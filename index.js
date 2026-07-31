@@ -19,7 +19,7 @@ const MODULE_NAME = 'SillyTavern-Telegram-Connector';
 
 // 默认设置：Object.freeze 防止意外修改
 const DEFAULT_SETTINGS = Object.freeze({
-    bridgeUrl: 'ws://127.0.0.1:2333',
+    bridgeUrl: '',                   // 留空 = 自动探测内置 Server（酒馆 Server 插件）；填写则手动连接
     autoConnect: true,
     // ---- Multiplayer 设置 ----
     multiplayerEnabled: false,      // 是否启用群组多人模式
@@ -27,6 +27,9 @@ const DEFAULT_SETTINGS = Object.freeze({
     defaultMode: 'instant',          // 默认游戏模式: 'instant'(即时) | 'buffered'(缓冲)
     bufferWindowSeconds: 30,         // 缓冲模式：收集窗口（秒）
     bufferMaxMessages: 8,            // 缓冲模式：最多收集消息数，达到立即触发
+    // ---- 真实对话行为 ----
+    mergeWindowSeconds: 3,           // 即时模式：连续消息合并窗口（秒），0 = 每条消息立即回复
+    syncLocalToTelegram: true,       // 酒馆本地生成的 AI 回复也推送到最近活跃的 Telegram 聊天
 });
 
 let ws = null; // WebSocket实例
@@ -256,6 +259,38 @@ function flushBuffer() {
     enqueueOrProcess({ chatId: b.chatId, text, username: null, isGroup: false });
 }
 
+// --- 防连发合并（即时模式） ---
+// 玩家连续发送多条短消息时，在合并窗口内攒成一条再触发 AI 回复，更接近真实聊天
+let mergeBuffer = null; // { chatId, parts: [item], timer }
+
+function addToMergeBuffer(item, windowSeconds) {
+    if (!mergeBuffer || mergeBuffer.chatId !== item.chatId) {
+        if (mergeBuffer) flushMergeBuffer();
+        mergeBuffer = { chatId: item.chatId, parts: [], timer: null };
+    }
+    mergeBuffer.parts.push(item);
+    if (mergeBuffer.timer) clearTimeout(mergeBuffer.timer);
+    mergeBuffer.timer = setTimeout(flushMergeBuffer, windowSeconds * 1000);
+    console.log(`[Telegram Bridge] 消息进入合并窗口 (${mergeBuffer.parts.length} 条)，${windowSeconds} 秒后触发`);
+}
+
+function flushMergeBuffer() {
+    if (!mergeBuffer) return;
+    const b = mergeBuffer;
+    mergeBuffer = null;
+    if (b.timer) clearTimeout(b.timer);
+
+    const settings = getSettings();
+    const lines = b.parts.map(p => {
+        if (p.isGroup && settings.multiplayerEnabled && p.username) {
+            return applyUserPrefix(p.username, p.text);
+        }
+        return p.text;
+    });
+    console.log(`[Telegram Bridge] 合并窗口到期 (${lines.length} 条) → 触发一次回复`);
+    enqueueOrProcess({ chatId: b.chatId, text: lines.join('\n'), username: null, isGroup: false });
+}
+
 /**
  * 实际处理一条（或一批）玩家消息：注入 ST 并触发生成
  * @param {object} item - { chatId, text, username, isGroup }
@@ -273,14 +308,20 @@ async function processMessage(item) {
     }
 
     // 2. 将用户消息添加到SillyTavern
-    //    - Multiplayer 且来自群组时，添加玩家名前缀
-    //    - 缓冲模式冲刷出的合并消息（username=null）不再重复加前缀
+    //    - 群组 + Multiplayer：添加玩家名前缀（AI 能区分谁说的）
+    //    - 私聊：传 name 参数标识消息来源，不再裸注入成"酒馆终端用户"
+    //    - 缓冲/合并冲刷出的消息（username=null）保持原样
     let messageText = item.text;
-    if (item.username && item.isGroup && getSettings().multiplayerEnabled) {
-        messageText = applyUserPrefix(item.username, item.text);
+    let messageAuthorName = null;
+    if (item.isGroup) {
+        if (item.username && getSettings().multiplayerEnabled) {
+            messageText = applyUserPrefix(item.username, item.text);
+        }
+    } else if (item.username) {
+        messageAuthorName = item.username;
     }
     try {
-        await sendMessageAsUser(messageText);
+        await sendMessageAsUser(messageText, null, null, false, messageAuthorName);
     } catch (err) {
         console.error('[Telegram Bridge] sendMessageAsUser() 错误:', err);
         isGenerating = false;
@@ -380,20 +421,54 @@ async function processMessage(item) {
 
 // --- WebSocket 连接 ---
 
-function connect() {
+/**
+ * 探测酒馆内置 Server（plugins/telegram-bridge）
+ * @returns {Promise<object|null>} { running, wssPort, configured, ... } 或 null（插件未安装）
+ */
+async function discoverEmbeddedServer() {
+    try {
+        const response = await fetch('/api/plugins/telegram-bridge/status', { cache: 'no-store' });
+        if (!response.ok) return null;
+        return await response.json();
+    } catch (error) {
+        console.warn('[Telegram Bridge] 内置 Server 探测失败:', error);
+        return null;
+    }
+}
+
+async function connect() {
     if (ws && ws.readyState === WebSocket.OPEN) {
         console.log('[Telegram Bridge] 已连接');
         return;
     }
     const settings = getSettings();
-    if (!settings.bridgeUrl) {
+    let url = settings.bridgeUrl;
+
+    // bridgeUrl 留空 → 自动探测内置 Server（酒馆 Server 插件），自动获取端口
+    if (!url) {
+        updateStatus('自动探测内置 Server...', 'orange');
+        const embedded = await discoverEmbeddedServer();
+        if (embedded && embedded.running && embedded.wssPort) {
+            const host = window.location.hostname || '127.0.0.1';
+            url = `ws://${host}:${embedded.wssPort}`;
+            console.log(`[Telegram Bridge] 自动发现内置 Server，端口 ${embedded.wssPort}`);
+        } else {
+            const reason = embedded ? (embedded.configured ? '未运行' : '未配置 Token') : '插件未安装';
+            console.error(`[Telegram Bridge] 内置 Server 不可用: ${reason}`);
+            updateStatus(`内置 Server 不可用（${reason}），请在设置面板配置`, 'red');
+            return;
+        }
+    }
+
+    if (!url) {
         updateStatus('URL 未设置！', 'red');
         return;
     }
-    updateStatus('连接中...', 'orange');
-    console.log(`[Telegram Bridge] 正在连接 ${settings.bridgeUrl}...`);
 
-    ws = new WebSocket(settings.bridgeUrl);
+    updateStatus('连接中...', 'orange');
+    console.log(`[Telegram Bridge] 正在连接 ${url}...`);
+
+    ws = new WebSocket(url);
 
     ws.onopen = () => {
         console.log('[Telegram Bridge] 连接成功！');
@@ -426,13 +501,20 @@ function connect() {
 
                 const settings = getSettings();
 
-                // 缓冲模式：群组多人消息先进缓冲区
+                // 缓冲模式：群组多人消息先进缓冲区（大窗口合并）
                 if (settings.multiplayerEnabled && settings.defaultMode === 'buffered' && item.isGroup) {
                     addToBuffer(item);
                     return;
                 }
 
-                // 即时模式（或非群组/未启用多人）：入队或直接处理
+                // 即时模式防连发：合并窗口内同一聊天的连续消息攒成一条（更接近真实聊天）
+                const mergeWindow = settings.mergeWindowSeconds || 0;
+                if (mergeWindow > 0) {
+                    addToMergeBuffer(item, mergeWindow);
+                    return;
+                }
+
+                // 无合并：入队或直接处理
                 enqueueOrProcess(item);
                 return;
             }
@@ -730,10 +812,42 @@ function decodeHtmlEntities(text) {
 
 // --- 最终消息处理 ---
 
+/**
+ * 酒馆本地生成的 AI 回复（非 Telegram 触发）→ 同步推送到最近活跃的 Telegram 聊天
+ */
+function handleLocalGeneration(lastMessageIdInChatArray) {
+    if (!getSettings().syncLocalToTelegram) return;
+
+    let lastMessageIndex;
+    if (typeof lastMessageIdInChatArray === 'number' && lastMessageIdInChatArray > 0) {
+        lastMessageIndex = lastMessageIdInChatArray - 1;
+    } else {
+        const currentChat = SillyTavern.getContext().chat;
+        lastMessageIndex = Array.isArray(currentChat) ? currentChat.length - 1 : -1;
+    }
+    if (lastMessageIndex < 0) return;
+
+    setTimeout(() => {
+        const context = SillyTavern.getContext();
+        const lastMessage = context.chat[lastMessageIndex];
+        if (!lastMessage || lastMessage.is_user || lastMessage.is_system) return;
+        if (typeof lastMessage.mes !== 'string' || !lastMessage.mes.trim()) return;
+
+        console.log('[Telegram Bridge] 酒馆本地生成，同步到 Telegram:', lastMessage.mes.slice(0, 50));
+        ws.send(JSON.stringify({ type: 'local_reply', text: lastMessage.mes.trim() }));
+    }, 100);
+}
+
 function handleFinalMessage(lastMessageIdInChatArray) {
     console.log(`[Telegram Bridge] handleFinalMessage 被调用, lastMessageId: ${lastMessageIdInChatArray}, lastProcessedChatId: ${lastProcessedChatId}`);
 
-    if (!ws || ws.readyState !== WebSocket.OPEN || !lastProcessedChatId) {
+    if (!ws || ws.readyState !== WebSocket.OPEN) {
+        return;
+    }
+
+    // 非 Telegram 触发的生成（酒馆本地用户操作）→ 双向同步
+    if (!lastProcessedChatId) {
+        handleLocalGeneration(lastMessageIdInChatArray);
         return;
     }
 
@@ -797,6 +911,10 @@ function cleanupStreamSession() {
         if (buffer.timer) clearTimeout(buffer.timer);
         buffer = null;
     }
+    if (mergeBuffer) {
+        if (mergeBuffer.timer) clearTimeout(mergeBuffer.timer);
+        mergeBuffer = null;
+    }
     if (ws && ws.readyState === WebSocket.OPEN && lastProcessedChatId) {
         ws.send(JSON.stringify({
             type: 'cleanup_session',
@@ -849,8 +967,10 @@ function bindSettingsUI() {
     $('#telegram_multiplayer_enabled').prop('checked', settings.multiplayerEnabled);
     $('#telegram_user_prefix').val(settings.userPrefix);
     $('#telegram_default_mode').val(settings.defaultMode);
+    $('#telegram_merge_window').val(settings.mergeWindowSeconds);
     $('#telegram_buffer_window').val(settings.bufferWindowSeconds);
     $('#telegram_buffer_max').val(settings.bufferMaxMessages);
+    $('#telegram_sync_local').prop('checked', settings.syncLocalToTelegram);
 
     $('#telegram_bridge_url').on('input', () => {
         getSettings().bridgeUrl = $('#telegram_bridge_url').val();
@@ -902,13 +1022,101 @@ function bindSettingsUI() {
         saveSettingsDebounced();
     });
 
+    $('#telegram_merge_window').on('change', function () {
+        const value = parseInt($(this).val());
+        getSettings().mergeWindowSeconds = isNaN(value) || value < 0 ? 3 : value;
+        console.log(`[Telegram Bridge] 合并窗口: ${getSettings().mergeWindowSeconds} 秒`);
+        saveSettingsDebounced();
+    });
+
+    $('#telegram_sync_local').on('change', function () {
+        getSettings().syncLocalToTelegram = $(this).prop('checked');
+        console.log(`[Telegram Bridge] 双向同步: ${getSettings().syncLocalToTelegram ? '开启' : '关闭'}`);
+        saveSettingsDebounced();
+    });
+
     $('#telegram_connect_button').on('click', connect);
     $('#telegram_disconnect_button').on('click', disconnect);
+
+    // --- 内置 Server 管理（酒馆 Server 插件） ---
+    bindEmbeddedServerControls();
 
     if (settings.autoConnect) {
         console.log('[Telegram Bridge] 自动连接已启用，正在连接...');
         connect();
     }
+}
+
+/**
+ * 刷新内置 Server 状态显示
+ */
+async function refreshEmbeddedStatus() {
+    const el = document.getElementById('telegram_server_status');
+    if (!el) return;
+    const embedded = await discoverEmbeddedServer();
+    if (!embedded) {
+        el.innerHTML = '<span style="color:orange">插件未安装</span>（未检测到 plugins/telegram-bridge，将使用独立 Server 模式）';
+        return;
+    }
+    if (embedded.running && embedded.botConnected) {
+        el.innerHTML = `<span style="color:green">● 运行中</span> · WebSocket 端口 <b>${embedded.wssPort}</b> · Bot 已连接`;
+    } else if (embedded.running) {
+        el.innerHTML = `<span style="color:orange">● 运行中（Bot 未连接）</span> · 端口 ${embedded.wssPort}`;
+    } else {
+        el.innerHTML = `<span style="color:red">○ 未运行</span>（${embedded.configured ? '已配置 Token，可点「启动」' : '未配置 Token，请先保存'}）`;
+    }
+}
+
+function bindEmbeddedServerControls() {
+    $('#telegram_token_save').on('click', async () => {
+        const token = $('#telegram_bot_token').val().trim();
+        if (!token) {
+            toastr?.warning?.('请输入 Bot Token');
+            return;
+        }
+        const response = await fetch('/api/plugins/telegram-bridge/config', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ telegramToken: token }),
+        });
+        const result = await response.json();
+        console.log('[Telegram Bridge] 保存 Token 结果:', result);
+        toastr?.success?.(result.ok ? 'Token 已保存' : `保存失败: ${result.error || ''}`);
+        refreshEmbeddedStatus();
+    });
+
+    $('#telegram_server_start').on('click', async () => {
+        const token = $('#telegram_bot_token').val().trim();
+        const response = await fetch('/api/plugins/telegram-bridge/start', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ telegramToken: token }),
+        });
+        const result = await response.json();
+        console.log('[Telegram Bridge] 启动内置 Server 结果:', result);
+        if (result.ok && result.wssPort) {
+            toastr?.success?.(`内置 Server 已启动，端口 ${result.wssPort}`);
+            // 若 URL 留空（自动模式），直接连接
+            if (!getSettings().bridgeUrl) connect();
+        } else {
+            toastr?.error?.(`启动失败: ${result.error || '未知错误'}`);
+        }
+        refreshEmbeddedStatus();
+    });
+
+    $('#telegram_server_stop').on('click', async () => {
+        const response = await fetch('/api/plugins/telegram-bridge/stop', { method: 'POST' });
+        const result = await response.json();
+        console.log('[Telegram Bridge] 停止内置 Server 结果:', result);
+        toastr?.success?.('内置 Server 已停止');
+        if (ws) disconnect();
+        refreshEmbeddedStatus();
+    });
+
+    $('#telegram_server_refresh').on('click', refreshEmbeddedStatus);
+
+    // 初始刷新状态
+    setTimeout(refreshEmbeddedStatus, 300);
 }
 
 // --- 生命周期钩子（官方推荐） ---
