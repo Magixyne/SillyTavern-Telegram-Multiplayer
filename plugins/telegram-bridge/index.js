@@ -204,8 +204,9 @@ class TelegramBotClient {
         }
 
         if (!sillyTavernClient || sillyTavernClient.readyState !== WebSocket.OPEN) {
-            logWithTimestamp('warn', `收到消息但酒馆扩展未连接: ${text.slice(0, 50)}`);
-            this.sendMessage(chatId, '抱歉，我现在无法连接到 SillyTavern。请确保酒馆已打开并启用了 Telegram 扩展。');
+            // 未连接：只在终端提示，不向 Telegram 回复，避免群聊刷屏
+            logWithTimestamp('warn', `收到来自 ${chatId} 的消息但酒馆扩展未连接，已忽略: "${text.slice(0, 50)}"`);
+            logWithTimestamp('warn', '提示：请在酒馆扩展中开启并连接 Telegram 扩展。');
             return;
         }
 
