@@ -3,6 +3,7 @@ const TelegramBot = require('node-telegram-bot-api');
 const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
+const os = require('os');
 const MessageFormatter = require('./messageFormatter');
 
 // Telegram 消息长度限制
@@ -55,6 +56,244 @@ function splitLongMessage(text, maxLength = TELEGRAM_MAX_LENGTH) {
     return parts;
 }
 
+
+// Upload/import state. Files are handled only after user enters upload mode.
+const UPLOAD_DIR = process.env.BRIDGE_UPLOAD_DIR || path.join(os.tmpdir(), 'st-bridge-uploads');
+const UPLOAD_TTL_MS = Number(process.env.BRIDGE_UPLOAD_TTL_MS || 5 * 60 * 1000);
+const MAX_CHARACTER_UPLOAD_BYTES = Number(process.env.BRIDGE_MAX_CHARACTER_UPLOAD_BYTES || 20 * 1024 * 1024);
+const MAX_PRESET_UPLOAD_BYTES = Number(process.env.BRIDGE_MAX_PRESET_UPLOAD_BYTES || 2 * 1024 * 1024);
+const uploadSessions = new Map();
+const pendingUploads = new Map();
+
+function ensureUploadDir() {
+    fs.mkdirSync(UPLOAD_DIR, { recursive: true, mode: 0o700 });
+}
+
+function cleanupUploadFile(filePath) {
+    if (!filePath) return;
+    fs.unlink(filePath, () => {});
+}
+
+function getUploadSessionKey(chatId, userId) {
+    return `${chatId}:${userId}`;
+}
+
+function clearUploadSession(chatId, userId, deleteFile = false) {
+    const key = getUploadSessionKey(chatId, userId);
+    const session = uploadSessions.get(key);
+    if (deleteFile && session?.localPath) cleanupUploadFile(session.localPath);
+    uploadSessions.delete(key);
+}
+
+function setUploadSession(chatId, userId, mode) {
+    ensureUploadDir();
+    clearUploadSession(chatId, userId, true);
+    const session = { chatId, userId, mode, key: getUploadSessionKey(chatId, userId), createdAt: Date.now(), expiresAt: Date.now() + UPLOAD_TTL_MS };
+    uploadSessions.set(session.key, session);
+    setTimeout(() => {
+        const current = uploadSessions.get(session.key);
+        if (current && current.createdAt === session.createdAt && !current.fileId) {
+            uploadSessions.delete(session.key);
+        }
+    }, UPLOAD_TTL_MS + 1000);
+    return session;
+}
+
+function getActiveUploadSession(chatId, userId) {
+    const key = getUploadSessionKey(chatId, userId);
+    const session = uploadSessions.get(key);
+    if (!session) return null;
+    if (Date.now() > session.expiresAt) {
+        clearUploadSession(chatId, userId, true);
+        return null;
+    }
+    return session;
+}
+
+function sanitizeUploadFileName(fileName) {
+    const base = path.basename(String(fileName || 'upload.bin')).replace(/[\\/:*?"<>|\x00-\x1f]/g, '_').trim();
+    return base || 'upload.bin';
+}
+
+function detectUploadKind(fileName, buffer, requestedMode) {
+    const ext = path.extname(fileName).slice(1).toLowerCase();
+    const result = { ok: false, ext, kind: 'unknown', label: '未知文件', error: '', name: path.basename(fileName, path.extname(fileName)) };
+    if (!['png', 'json'].includes(ext)) {
+        result.error = '仅支持 .png / .json';
+        return result;
+    }
+    if (['png'].includes(ext)) {
+        if (requestedMode === 'preset') {
+            result.error = '预设文件仅支持 JSON';
+            return result;
+        }
+        result.ok = true;
+        result.kind = 'character';
+        result.label = `${ext.toUpperCase()} 角色卡`;
+        return result;
+    }
+    let json = null;
+    try {
+        json = JSON.parse(buffer.toString('utf8'));
+    } catch (error) {
+        result.error = 'JSON 解析失败';
+        return result;
+    }
+    const characterHints = ['name', 'description', 'personality', 'scenario', 'first_mes', 'mes_example'];
+    const cardV2Hints = json && typeof json === 'object' && json.data && typeof json.data === 'object'
+        ? ['name', 'description', 'personality', 'scenario', 'first_mes', 'mes_example'].some(k => json.data[k])
+        : false;
+    const looksCharacter = json && typeof json === 'object' && (characterHints.some(k => json[k]) || cardV2Hints || json.spec === 'chara_card_v2');
+    const looksPreset = json && typeof json === 'object' && !Array.isArray(json) && (
+        Object.prototype.hasOwnProperty.call(json, 'temperature')
+        || Object.prototype.hasOwnProperty.call(json, 'top_p')
+        || Object.prototype.hasOwnProperty.call(json, 'max_context_unlocked')
+        || Object.prototype.hasOwnProperty.call(json, 'prompts')
+        || Object.prototype.hasOwnProperty.call(json, 'prompt_order')
+        || Object.prototype.hasOwnProperty.call(json, 'chat_completion_source')
+    );
+    if (requestedMode === 'character') {
+        if (!looksCharacter) {
+            result.error = 'JSON 不像角色卡；如需导入预设，请选择“预设文件”或“自动识别”。';
+            return result;
+        }
+        result.ok = true; result.kind = 'character'; result.label = 'JSON 角色卡'; return result;
+    }
+    if (requestedMode === 'preset') {
+        if (!looksPreset) {
+            result.error = 'JSON 不像 OpenAI/Chat Completion 预设；如确认是预设，请用自动识别后手动选择。';
+            return result;
+        }
+        result.ok = true; result.kind = 'preset_openai'; result.label = 'OpenAI/Chat Completion 预设'; return result;
+    }
+    if (looksCharacter && !looksPreset) {
+        result.ok = true; result.kind = 'character'; result.label = 'JSON 角色卡'; return result;
+    }
+    if (looksPreset && !looksCharacter) {
+        result.ok = true; result.kind = 'preset_openai'; result.label = 'OpenAI/Chat Completion 预设'; return result;
+    }
+    if (looksCharacter && looksPreset) {
+        result.ok = true; result.kind = 'ambiguous'; result.label = 'JSON 可能是角色卡或预设'; return result;
+    }
+    result.error = '无法识别 JSON 类型';
+    return result;
+}
+
+function makeUploadId() {
+    return `${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`;
+}
+
+function getUploadMenuKeyboard() {
+    return {
+        inline_keyboard: [
+            [{ text: '👤 角色卡', callback_data: 'cmd_upload_character' }, { text: '🎛️ 预设文件', callback_data: 'cmd_upload_preset' }],
+            [{ text: '🔍 自动识别', callback_data: 'cmd_upload_auto' }, { text: '取消', callback_data: 'cmd_upload_cancel' }],
+        ],
+    };
+}
+
+async function handleUploadDocument(msg) {
+    const chatId = msg.chat.id;
+    const userId = msg.from.id;
+    const session = getActiveUploadSession(chatId, userId);
+    if (!session) return false;
+
+    const file = msg.document || (msg.photo && msg.photo[msg.photo.length - 1]);
+    if (!file) return false;
+
+    const originalName = sanitizeUploadFileName(msg.document?.file_name || `photo_${file.file_unique_id || file.file_id}.jpg`);
+    const ext = path.extname(originalName).slice(1).toLowerCase();
+    if (!msg.document) {
+        await bot.sendMessage(chatId, '请以“文件/Document”方式上传角色卡，不要以压缩图片方式发送。');
+        return true;
+    }
+
+    const limit = session.mode === 'preset' ? MAX_PRESET_UPLOAD_BYTES : MAX_CHARACTER_UPLOAD_BYTES;
+    if (file.file_size && file.file_size > limit) {
+        await bot.sendMessage(chatId, `文件过大：${(file.file_size / 1024 / 1024).toFixed(2)} MB，当前模式上限 ${(limit / 1024 / 1024).toFixed(0)} MB。`);
+        return true;
+    }
+    if (!['png', 'json'].includes(ext)) {
+        await bot.sendMessage(chatId, '文件类型不支持。角色卡支持 PNG/JSON；预设支持 JSON。');
+        return true;
+    }
+
+    try {
+        ensureUploadDir();
+        const safeName = `${Date.now()}-${Math.random().toString(36).slice(2, 8)}-${originalName}`;
+        const localPath = path.join(UPLOAD_DIR, safeName);
+        await bot.downloadFile(file.file_id, UPLOAD_DIR).then(downloadedPath => fs.promises.rename(downloadedPath, localPath));
+        const stat = await fs.promises.stat(localPath);
+        if (stat.size > limit) {
+            cleanupUploadFile(localPath);
+            await bot.sendMessage(chatId, `文件过大：${(stat.size / 1024 / 1024).toFixed(2)} MB，当前模式上限 ${(limit / 1024 / 1024).toFixed(0)} MB。`);
+            return true;
+        }
+        const buffer = await fs.promises.readFile(localPath);
+        const detected = detectUploadKind(originalName, buffer, session.mode);
+        if (!detected.ok) {
+            cleanupUploadFile(localPath);
+            await bot.sendMessage(chatId, `检测失败：${detected.error}`);
+            return true;
+        }
+        if (session.fileId) {
+            const previous = pendingUploads.get(session.fileId);
+            if (previous) {
+                pendingUploads.delete(session.fileId);
+                cleanupUploadFile(previous.localPath);
+            }
+        }
+
+        const uploadId = makeUploadId();
+        const pending = {
+            id: uploadId,
+            chatId,
+            userId,
+            mode: session.mode,
+            localPath,
+            fileName: originalName,
+            size: stat.size,
+            detected,
+            expiresAt: Date.now() + UPLOAD_TTL_MS,
+        };
+        pendingUploads.set(uploadId, pending);
+        session.fileId = uploadId;
+        session.localPath = localPath;
+        setTimeout(() => {
+            const item = pendingUploads.get(uploadId);
+            if (item && Date.now() > item.expiresAt) {
+                pendingUploads.delete(uploadId);
+                cleanupUploadFile(item.localPath);
+                const currentSession = uploadSessions.get(item.key);
+                if (currentSession?.fileId === uploadId) {
+                    uploadSessions.delete(item.key);
+                }
+            }
+        }, UPLOAD_TTL_MS + 1000);
+
+        const keyboard = [];
+        if (detected.kind === 'ambiguous') {
+            keyboard.push([{ text: '作为角色卡导入', callback_data: `cmd_upload_import_char_${uploadId}` }]);
+            keyboard.push([{ text: '作为 OpenAI 预设导入', callback_data: `cmd_upload_import_preset_${uploadId}` }]);
+        } else if (detected.kind === 'character') {
+            keyboard.push([{ text: '导入角色卡', callback_data: `cmd_upload_import_char_${uploadId}` }]);
+            keyboard.push([{ text: '导入并切换', callback_data: `cmd_upload_import_switch_${uploadId}` }]);
+        } else if (detected.kind === 'preset_openai') {
+            keyboard.push([{ text: '导入 OpenAI 预设', callback_data: `cmd_upload_import_preset_${uploadId}` }]);
+            keyboard.push([{ text: '导入并切换预设', callback_data: `cmd_upload_import_preset_switch_${uploadId}` }]);
+        }
+        keyboard.push([{ text: '取消', callback_data: `cmd_upload_cancel_${uploadId}` }]);
+        await bot.sendMessage(chatId,
+            `检测到文件：${originalName}\n类型：${detected.label}\n大小：${(stat.size / 1024 / 1024).toFixed(2)} MB\n\n请选择操作：`,
+            { reply_markup: { inline_keyboard: keyboard } });
+        return true;
+    } catch (error) {
+        logWithTimestamp('error', `处理上传文件失败: ${error.message}`);
+        await bot.sendMessage(chatId, `处理上传文件失败：${error.message}`);
+        return true;
+    }
+}
+
 // 存储长消息的缓存，用于分页显示
 const longMessageCache = new Map();
 
@@ -84,7 +323,7 @@ async function sendLongMessage(bot, chatId, text, options = {}) {
     const PAGE_SIZE = 3500; // 每页字符数
     const parts = [];
     let remaining = text;
-    
+
     while (remaining.length > 0) {
         if (remaining.length <= PAGE_SIZE) {
             parts.push(remaining);
@@ -105,7 +344,7 @@ async function sendLongMessage(bot, chatId, text, options = {}) {
     // 生成唯一的缓存ID
     const cacheId = `msg_${chatId}_${Date.now()}`;
     longMessageCache.set(cacheId, { parts, chatId });
-    
+
     // 5分钟后自动清理缓存
     setTimeout(() => longMessageCache.delete(cacheId), 5 * 60 * 1000);
 
@@ -246,16 +485,25 @@ const exampleConfigPath = path.join(__dirname, './config.example.js');
 let config = {};
 let configSourceName = 'config.js';
 
+// 测试模式：禁用 Telegram polling，避免测试容器抢占生产 Bot updates
+const telegramDisabled = ['1', 'true', 'yes'].includes(String(process.env.BRIDGE_TELEGRAM_DISABLED || process.env.TELEGRAM_DISABLED || '').toLowerCase());
+
 // 如果配置文件存在，加载它作为基础配置
 if (fs.existsSync(configPath)) {
     config = require('./config');
 } else if (fs.existsSync(exampleConfigPath)) {
+
     // 开发模式：没有 config.js 时自动回退到 config.example.js
+
     config = require('./config.example.js');
+
     configSourceName = 'config.example.js（开发模式，未找到 config.js）';
+
     logWithTimestamp('warn', '未找到 config.js，已自动回退到 config.example.js（开发模式）');
+
     logWithTimestamp('warn', '如需持久化配置，请复制 config.example.js 为 config.js 后修改');
-} else if (!process.env.TELEGRAM_BOT_TOKEN) {
+
+} else if (!telegramDisabled && !process.env.TELEGRAM_BOT_TOKEN) {
     // 如果既没有配置文件也没有环境变量，则报错
     logWithTimestamp('error', '错误: 找不到配置文件 config.js 且未设置 TELEGRAM_BOT_TOKEN 环境变量！');
     logWithTimestamp('error', '请在server目录下复制 config.example.js 为 config.js，或设置 TELEGRAM_BOT_TOKEN 环境变量');
@@ -264,7 +512,8 @@ if (fs.existsSync(configPath)) {
 
 // 环境变量优先级高于配置文件 (Requirements 2.3, 2.4)
 // 读取 TELEGRAM_BOT_TOKEN 环境变量（let：开发模式下可能通过控制台输入覆盖）
-let token = process.env.TELEGRAM_BOT_TOKEN || config.telegramToken;
+
+let token = process.env.TELEGRAM_BOT_TOKEN || config.telegramToken || (telegramDisabled ? '0:disabled' : undefined);
 
 // 读取 WSS_PORT 环境变量
 const wssPort = parseInt(process.env.WSS_PORT) || config.wssPort || 2333;
@@ -305,62 +554,143 @@ if (process.env.MESSAGE_PARSE_MODE) {
 
 // 检查是否修改了默认token
 function isPlaceholderToken(t) {
+
     return !t || t === 'TOKEN' || t === 'YOUR_TELEGRAM_BOT_TOKEN_HERE';
+
 }
+
+
 
 /**
+
  * 从控制台同步读取一行输入（开发模式手动输入 Token 用）
+
  * @param {string} promptText - 提示文字
+
  * @returns {string} 用户输入的内容（已去除首尾空白）
+
  */
+
 function readLineSync(promptText) {
+
     if (promptText) process.stdout.write(promptText);
+
     let line = '';
+
     const buf = Buffer.alloc(1);
+
     try {
+
         while (true) {
+
             const bytesRead = fs.readSync(process.stdin.fd, buf, 0, 1, null);
+
             if (bytesRead <= 0) break;
+
             const ch = buf.toString('utf8');
+
             // Windows 控制台回车是 \r\n，两者都视为行结束
+
             if (ch === '\n' || ch === '\r') break;
+
             line += ch;
+
         }
+
     } catch (error) {
+
         return '';
+
     }
+
     return line.trim();
+
 }
 
-// 如果 token 无效（占位符/为空）：
+
+
+// 如果 token 无效（占位符/为空）且未禁用 Telegram：
+
 // - 交互式终端（开发模式）→ 在控制台手动输入 token（仅本次运行有效）
+
 // - 非交互环境（Docker/后台）→ 保持原来的报错退出行为
-if (isPlaceholderToken(token)) {
+
+if (!telegramDisabled && isPlaceholderToken(token)) {
+
     if (process.stdin.isTTY) {
+
         logWithTimestamp('warn', '未检测到有效的 Telegram Bot Token。');
+
         logWithTimestamp('warn', '开发模式：请在下方手动输入 Token（输入后按回车）：');
+
         const inputToken = readLineSync('> ');
+
         if (inputToken) {
+
             token = inputToken;
+
             logWithTimestamp('log', '已通过控制台输入 Token（仅本次运行有效，不会写入配置文件）。');
+
         } else {
+
             logWithTimestamp('error', '错误: 未输入有效的 Token，程序退出。');
+
             logWithTimestamp('error', '也可以通过环境变量 TELEGRAM_BOT_TOKEN 或在 config.js 中设置 telegramToken');
+
             process.exit(1); // 终止程序
+
         }
+
     } else {
+
         logWithTimestamp('error', '错误: 请设置有效的 Telegram Bot Token！');
+
         logWithTimestamp('error', '可以通过环境变量 TELEGRAM_BOT_TOKEN 或在 config.js 中设置 telegramToken，');
+
         logWithTimestamp('error', '或在交互式终端运行本程序后手动输入 Token');
+
         process.exit(1); // 终止程序
+
     }
+
 }
 
-// 初始化Telegram Bot，但不立即启动轮询
-const bot = new TelegramBot(token, { polling: false });
-logWithTimestamp('log', `正在初始化Telegram Bot...（配置来源: ${configSourceName}）`);
+
+
+// 初始化Telegram Bot，但不立即启动轮询；测试模式下使用 no-op bot
+
+const bot = telegramDisabled ? {
+
+    sendMessage: async (chatId, text) => {
+
+        logWithTimestamp('log', `[Telegram disabled] sendMessage chatId=${chatId}, length=${String(text || '').length}`);
+
+        return { message_id: Date.now() };
+
+    },
+
+    editMessageText: async () => ({}),
+
+    deleteMessage: async () => ({}),
+
+    sendChatAction: async () => ({}),
+
+    answerCallbackQuery: async () => ({}),
+
+    getUpdates: async () => [],
+
+    startPolling: () => {},
+
+    stopPolling: async () => {},
+
+    on: () => {},
+
+} : new TelegramBot(token, { polling: false });
+
+logWithTimestamp('log', telegramDisabled ? 'Telegram Bot 已禁用（测试模式）' : `正在初始化Telegram Bot...（配置来源: ${configSourceName}）`);
 
 // 手动清除所有未处理的消息，然后启动轮询
+if (!telegramDisabled) {
 (async function clearAndStartPolling() {
     try {
         logWithTimestamp('log', '正在清除Telegram消息队列...');
@@ -416,6 +746,9 @@ logWithTimestamp('log', `正在初始化Telegram Bot...（配置来源: ${config
         logWithTimestamp('log', 'Telegram Bot轮询已启动（清除队列失败后）');
     }
 })();
+} else {
+    logWithTimestamp('log', '跳过 Telegram 消息队列清理与 polling 启动。');
+}
 
 // 初始化WebSocket服务器
 const wss = new WebSocket.Server({ port: wssPort });
@@ -433,6 +766,115 @@ const HEARTBEAT_INTERVAL = config.heartbeat?.interval || 30000; // 30秒
 // 用于存储正在进行的流式会话，调整会话结构，使用Promise来处理messageId
 // 结构: { messagePromise: Promise<number> | null, lastText: String, timer: NodeJS.Timeout | null, isEditing: boolean, typingInterval: NodeJS.Timeout | null, charCount: number }
 const ongoingStreams = new Map();
+
+// Bridge runtime profile/model configuration
+const BRIDGE_CONFIG_PATH = process.env.BRIDGE_CONFIG_PATH || path.join(__dirname, 'bridge-profiles.json');
+const BRIDGE_PRIVATE_CONFIG_PATH = process.env.BRIDGE_PRIVATE_CONFIG_PATH || path.join(__dirname, 'bridge-custom-profiles.private.json');
+let bridgeRuntimeConfig = { models: {}, profiles: {}, providers: {}, options: {} };
+let bridgePrivateConfig = { providers: {} };
+
+function loadBridgeRuntimeConfig() {
+    try {
+        if (!fs.existsSync(BRIDGE_CONFIG_PATH)) {
+            bridgeRuntimeConfig = { models: {}, profiles: {} };
+            logWithTimestamp('warn', `Bridge配置文件不存在: ${BRIDGE_CONFIG_PATH}，将使用空配置。`);
+            return bridgeRuntimeConfig;
+        }
+        const parsed = JSON.parse(fs.readFileSync(BRIDGE_CONFIG_PATH, 'utf8'));
+        bridgeRuntimeConfig = {
+            models: parsed.models && typeof parsed.models === 'object' ? parsed.models : {},
+            profiles: parsed.profiles && typeof parsed.profiles === 'object' ? parsed.profiles : {},
+            providers: parsed.providers && typeof parsed.providers === 'object' ? parsed.providers : {},
+            options: parsed.options && typeof parsed.options === 'object' ? parsed.options : {},
+        };
+        logWithTimestamp('log', `Bridge配置已加载: models=${Object.keys(bridgeRuntimeConfig.models).length}, profiles=${Object.keys(bridgeRuntimeConfig.profiles).length}`);
+        return bridgeRuntimeConfig;
+    } catch (error) {
+        logWithTimestamp('error', `Bridge配置加载失败: ${error.message}`);
+        return bridgeRuntimeConfig;
+    }
+}
+
+function loadBridgePrivateConfig() {
+    try {
+        if (!fs.existsSync(BRIDGE_PRIVATE_CONFIG_PATH)) {
+            bridgePrivateConfig = { providers: {} };
+            return bridgePrivateConfig;
+        }
+        const parsed = JSON.parse(fs.readFileSync(BRIDGE_PRIVATE_CONFIG_PATH, 'utf8'));
+        bridgePrivateConfig = {
+            providers: parsed.providers && typeof parsed.providers === 'object' ? parsed.providers : {},
+        };
+        logWithTimestamp('log', `Bridge私有连接配置已加载: providers=${Object.keys(bridgePrivateConfig.providers).length}`);
+    } catch (error) {
+        bridgePrivateConfig = { providers: {} };
+        logWithTimestamp('error', `Bridge私有连接配置加载失败: ${error.message}`);
+    }
+    return bridgePrivateConfig;
+}
+
+function clonePublicConfig() {
+    return JSON.parse(JSON.stringify(bridgeRuntimeConfig || { models: {}, profiles: {}, providers: {}, options: {} }));
+}
+
+function resolveProviderIdFromArgs(args = []) {
+    const text = String((args || []).join(' ') || '').trim();
+    const entries = Object.entries((bridgeRuntimeConfig && bridgeRuntimeConfig.providers) || {})
+        .filter(([, provider]) => provider && provider.enabled !== false);
+    if (!text) return null;
+    if (/^\d+$/.test(text)) {
+        const found = entries[Number(text) - 1];
+        return found ? found[0] : null;
+    }
+    const found = entries.find(([id, provider]) =>
+        id.toLowerCase() === text.toLowerCase()
+        || String(provider.label || '').toLowerCase() === text.toLowerCase()
+        || String(provider.source || '').toLowerCase() === text.toLowerCase()
+    );
+    return found ? found[0] : null;
+}
+
+function getBridgeRuntimeConfigForClient(command, args = []) {
+    const publicConfig = clonePublicConfig();
+    if (command === 'provider') {
+        const providerId = resolveProviderIdFromArgs(args);
+        const secret = providerId && bridgePrivateConfig.providers ? bridgePrivateConfig.providers[providerId] : null;
+        if (secret && secret.apiKey) {
+            publicConfig.selectedProviderSecret = { id: providerId, apiKey: secret.apiKey };
+        }
+    }
+    return publicConfig;
+}
+
+loadBridgeRuntimeConfig();
+loadBridgePrivateConfig();
+
+function sendBridgeExecuteCommand(command, args, chatId) {
+    if (!sillyTavernClient || sillyTavernClient.readyState !== WebSocket.OPEN) {
+        sendLongMessage(bot, chatId, 'SillyTavern未连接，无法执行该命令。请先确保SillyTavern已打开并启用了Telegram扩展。');
+        return false;
+    }
+    sillyTavernClient.send(JSON.stringify({
+        type: 'execute_command',
+        command,
+        args,
+        chatId,
+        bridgeConfig: getBridgeRuntimeConfigForClient(command, args),
+    }));
+    return true;
+}
+
+function isBridgeControlCommand(command) {
+    return [
+        'models', 'model', 'presets', 'preset', 'profiles', 'profile',
+        'providers', 'provider', 'provider_models', 'provider-models', 'provider_model', 'provider-model',
+        'bridge_status', 'bridge-reload', 'bridge_reload',
+    ].includes(command)
+        || /^model_/.test(command)
+        || /^preset_\d+$/.test(command)
+        || /^profile_/.test(command)
+        || /^provider_/.test(command);
+}
 
 // 流式输出配置
 const TYPING_INTERVAL = 4000; // 每4秒发送一次typing状态
@@ -706,7 +1148,7 @@ function handleSystemCommand(command, chatId) {
 }
 
 // 处理Telegram命令
-async function handleTelegramCommand(command, args, chatId) {
+async function handleTelegramCommand(command, args, chatId, userId = chatId) {
     logWithTimestamp('log', `处理Telegram命令: /${command} ${args.join(' ')}`);
 
     // 显示"输入中"状态
@@ -731,6 +1173,21 @@ async function handleTelegramCommand(command, args, chatId) {
                     { text: '📡 连接状态', callback_data: 'cmd_ping' }
                 ],
                 [
+                    { text: '🔌 供应商切换', callback_data: 'cmd_providers' },
+                    { text: '🤖 模型选择', callback_data: 'cmd_models' }
+                ],
+                [
+                    { text: '🧩 当前源模型', callback_data: 'cmd_provider_models' },
+                    { text: '🎛️ 预设切换', callback_data: 'cmd_presets' }
+                ],
+                [
+                    { text: '⚡ 模式档案', callback_data: 'cmd_profiles' },
+                    { text: '📊 Bridge状态', callback_data: 'cmd_bridge_status' }
+                ],
+                [
+                    { text: '📤 上传导入', callback_data: 'cmd_upload' }
+                ],
+                [
                     { text: '🔄 重载服务', callback_data: 'cmd_reload' },
                     { text: '❓ 命令帮助', callback_data: 'cmd_helptext' }
                 ]
@@ -747,10 +1204,14 @@ async function handleTelegramCommand(command, args, chatId) {
         replyText += `💬 聊天管理\n`;
         replyText += `/new - 开始新聊天\n`;
         replyText += `/listchats [页码] - 聊天记录列表\n`;
+        replyText += `/switchchat - 显示聊天记录切换按钮\n`;
         replyText += `/switchchat_<序号> - 切换聊天\n\n`;
         replyText += `👤 角色管理\n`;
         replyText += `/listchars [页码] - 角色列表\n`;
+        replyText += `/switchchar - 显示角色切换按钮\n`;
         replyText += `/switchchar_<序号> - 切换角色\n\n`;
+        replyText += `📤 上传导入\n`;
+        replyText += `/upload - 上传导入角色卡/预设\n\n`;
         replyText += `⚙️ 系统管理\n`;
         replyText += `/ping - 连接状态\n`;
         replyText += `/reload - 重载服务\n`;
@@ -761,7 +1222,82 @@ async function handleTelegramCommand(command, args, chatId) {
         return;
     }
 
+    if (command === 'upload') {
+
+        bot.sendMessage(chatId, '请选择要导入的类型：\n\n角色卡支持 PNG / JSON；预设文件第一版支持 OpenAI/Chat Completion JSON。', { reply_markup: getUploadMenuKeyboard() });
+
+        return;
+
+    }
+
+
+
+    if (command === 'upload_character' || command === 'upload_preset' || command === 'upload_auto') {
+
+        const mode = command.replace('upload_', '');
+
+        setUploadSession(chatId, userId, mode);
+
+        const modeText = mode === 'character' ? '角色卡文件（PNG / JSON）' : mode === 'preset' ? '预设 JSON 文件' : '可识别文件（PNG / JSON）';
+
+        bot.sendMessage(chatId, `请在 5 分钟内发送${modeText}。\n\n请以“文件/Document”方式发送，避免 Telegram 压缩图片。`);
+
+        return;
+
+    }
+
+
+
+    if (command === 'upload_cancel') {
+
+        clearUploadSession(chatId, userId, true);
+
+        bot.sendMessage(chatId, '已取消上传导入。');
+
+        return;
+
+    }
+
+
+
+    // Bridge runtime config reload: server-side first, then notify frontend if connected
+
+    if (command === 'bridge-reload' || command === 'bridge_reload') {
+
+        loadBridgeRuntimeConfig();
+
+        loadBridgePrivateConfig();
+
+        if (sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN) {
+
+            sendBridgeExecuteCommand('bridge_reload', args, chatId);
+
+        } else {
+
+            sendLongMessage(bot, chatId, `Bridge配置已重载。\n模型别名: ${Object.keys(bridgeRuntimeConfig.models || {}).length}\nProfiles: ${Object.keys(bridgeRuntimeConfig.profiles || {}).length}\nSillyTavern当前未连接，前端状态未回读。`);
+
+        }
+
+        return;
+
+    }
+
+
+
+    // Model / preset / profile commands are executed in SillyTavern frontend context
+
+    if (isBridgeControlCommand(command)) {
+
+        sendBridgeExecuteCommand(command, args, chatId);
+
+        return;
+
+    }
+
+
+
     // 检查SillyTavern是否连接（未连接时只在终端提示，不向 Telegram 回复，避免群聊刷屏）
+
     if (!sillyTavernClient || sillyTavernClient.readyState !== WebSocket.OPEN) {
         logWithTimestamp('warn', `命令 /${command} 被忽略：SillyTavern扩展未连接（chatId: ${chatId}）`);
         return;
@@ -788,7 +1324,14 @@ async function handleTelegramCommand(command, args, chatId) {
             return;
         case 'switchchar':
             if (args.length === 0) {
-                replyText = '请提供角色名称或序号。用法: /switchchar <角色名称> 或 /switchchar_数字';
+                // 无参数时直接打开角色列表，使用现有分页 + inline buttons 作为切换菜单
+                sillyTavernClient.send(JSON.stringify({
+                    type: 'execute_command',
+                    command: 'listchars',
+                    args: [],
+                    chatId: chatId
+                }));
+                return;
             } else {
                 // 发送命令到前端执行
                 sillyTavernClient.send(JSON.stringify({
@@ -799,7 +1342,6 @@ async function handleTelegramCommand(command, args, chatId) {
                 }));
                 return;
             }
-            break;
         case 'listchats':
             // 发送命令到前端执行（传递页码参数）
             sillyTavernClient.send(JSON.stringify({
@@ -811,7 +1353,14 @@ async function handleTelegramCommand(command, args, chatId) {
             return;
         case 'switchchat':
             if (args.length === 0) {
-                replyText = '请提供聊天记录名称。用法： /switchchat <聊天记录名称>';
+                // 无参数时直接打开当前角色的聊天记录列表，使用现有分页 + inline buttons 作为切换菜单
+                sillyTavernClient.send(JSON.stringify({
+                    type: 'execute_command',
+                    command: 'listchats',
+                    args: [],
+                    chatId: chatId
+                }));
+                return;
             } else {
                 // 发送命令到前端执行
                 sillyTavernClient.send(JSON.stringify({
@@ -822,7 +1371,6 @@ async function handleTelegramCommand(command, args, chatId) {
                 }));
                 return;
             }
-            break;
         default:
             // 处理特殊格式的命令，如 switchchar_1, switchchat_2 等
             const charMatch = command.match(/^switchchar_(\d+)$/);
@@ -1113,8 +1661,11 @@ wss.on('connection', ws => {
                     ongoingStreams.delete(data.chatId);
                 }
 
-                // 检查是否有分页信息，添加分页按钮
+                // 检查是否有按钮/分页信息，添加内联键盘
                 const sendOptions = {};
+                if (data.reply_markup) {
+                    sendOptions.reply_markup = data.reply_markup;
+                }
                 if (data.pagination) {
                     const { currentPage, totalPages, type } = data.pagination;
                     const buttons = [];
@@ -1129,8 +1680,9 @@ wss.on('connection', ws => {
                     }
 
                     if (buttons.length > 0) {
+                        const existingKeyboard = sendOptions.reply_markup?.inline_keyboard || [];
                         sendOptions.reply_markup = {
-                            inline_keyboard: [buttons]
+                            inline_keyboard: [...existingKeyboard, buttons]
                         };
                     }
                 }
@@ -1277,15 +1829,137 @@ bot.on('callback_query', async (callbackQuery) => {
     if (data.startsWith('cmd_')) {
         const command = data.replace('cmd_', '');
 
+        // 处理模型/预设/Profile命令
+        if (data === 'cmd_models' || data === 'cmd_presets' || data === 'cmd_profiles' || data === 'cmd_bridge_status' || data === 'cmd_providers' || data === 'cmd_provider_models') {
+            const mapped = data.replace('cmd_', '');
+            handleTelegramCommand(mapped, [], chatId, userId);
+            return;
+        }
+        if (data.startsWith('cmd_provider_page_')) {
+            handleTelegramCommand('provider_models', [data.replace('cmd_provider_page_', '')], chatId, userId);
+            return;
+        }
+        if (data.startsWith('cmd_provider_model_')) {
+            handleTelegramCommand('provider_model', [data.replace('cmd_provider_model_', '')], chatId, userId);
+            return;
+        }
+        if (data.startsWith('cmd_provider_')) {
+            handleTelegramCommand('provider', [data.replace('cmd_provider_', '')], chatId, userId);
+            return;
+        }
+        if (data.startsWith('cmd_model_')) {
+            handleTelegramCommand('model', [data.replace('cmd_model_', '')], chatId, userId);
+            return;
+        }
+        if (data.startsWith('cmd_preset_')) {
+            const presetIndex = data.replace('cmd_preset_', '');
+            handleTelegramCommand(`preset_${presetIndex}`, [], chatId, userId);
+            return;
+        }
+        if (data.startsWith('cmd_profile_')) {
+            handleTelegramCommand('profile', [data.replace('cmd_profile_', '')], chatId, userId);
+            return;
+        }
+        if (data.startsWith('cmd_switchchar_')) {
+            handleTelegramCommand(data.replace('cmd_', ''), [], chatId, userId);
+            return;
+        }
+        if (data.startsWith('cmd_switchchat_')) {
+            handleTelegramCommand(data.replace('cmd_', ''), [], chatId, userId);
+            return;
+        }
+        if (data === 'cmd_bridge_reload') {
+            handleTelegramCommand('bridge_reload', [], chatId, userId);
+            return;
+        }
+        if (data === 'cmd_upload') {
+            handleTelegramCommand('upload', [], chatId, userId);
+            return;
+        }
+        if (data === 'cmd_upload_character' || data === 'cmd_upload_preset' || data === 'cmd_upload_auto' || data === 'cmd_upload_cancel') {
+            handleTelegramCommand(data.replace('cmd_', ''), [], chatId, userId);
+            return;
+        }
+        if (data.startsWith('cmd_upload_cancel_')) {
+            const uploadId = data.replace('cmd_upload_cancel_', '');
+            const pending = pendingUploads.get(uploadId);
+            if (pending && pending.userId !== userId) {
+                bot.sendMessage(chatId, '这个上传取消不属于当前用户。');
+                return;
+            }
+            if (pending) {
+                pendingUploads.delete(uploadId);
+                cleanupUploadFile(pending.localPath);
+                clearUploadSession(chatId, pending.userId, false);
+            }
+            bot.sendMessage(chatId, '已取消上传导入。');
+            return;
+        }
+        if (data.startsWith('cmd_upload_import_char_') || data.startsWith('cmd_upload_import_switch_') || data.startsWith('cmd_upload_import_preset_') || data.startsWith('cmd_upload_import_preset_switch_')) {
+            let importCommand = '';
+            let uploadId = '';
+            if (data.startsWith('cmd_upload_import_preset_switch_')) {
+                importCommand = 'upload_import_preset_switch';
+                uploadId = data.replace('cmd_upload_import_preset_switch_', '');
+            } else if (data.startsWith('cmd_upload_import_preset_')) {
+                importCommand = 'upload_import_preset';
+                uploadId = data.replace('cmd_upload_import_preset_', '');
+            } else if (data.startsWith('cmd_upload_import_switch_')) {
+                importCommand = 'upload_import_switch';
+                uploadId = data.replace('cmd_upload_import_switch_', '');
+            } else {
+                importCommand = 'upload_import_char';
+                uploadId = data.replace('cmd_upload_import_char_', '');
+            }
+            const pending = pendingUploads.get(uploadId);
+            if (pending && pending.userId !== userId) {
+                bot.sendMessage(chatId, '这个上传确认不属于当前用户。');
+                return;
+            }
+            if (!pending || Date.now() > pending.expiresAt) {
+                if (pending) {
+                    pendingUploads.delete(uploadId);
+                    cleanupUploadFile(pending.localPath);
+                }
+                bot.sendMessage(chatId, '上传文件已过期，请重新上传。');
+                return;
+            }
+            const buffer = fs.readFileSync(pending.localPath);
+            const payload = {
+                type: 'execute_command',
+                command: importCommand,
+                args: [uploadId],
+                chatId,
+                bridgeConfig: getBridgeRuntimeConfigForClient(importCommand, [uploadId]),
+                upload: {
+                    id: uploadId,
+                    fileName: pending.fileName,
+                    dataBase64: buffer.toString('base64'),
+                    detected: pending.detected,
+                    switchAfter: importCommand.endsWith('_switch'),
+                },
+            };
+            if (!sillyTavernClient || sillyTavernClient.readyState !== WebSocket.OPEN) {
+                bot.sendMessage(chatId, 'SillyTavern未连接，无法导入。');
+                return;
+            }
+            sillyTavernClient.send(JSON.stringify(payload));
+            bot.sendMessage(chatId, '正在导入，请稍候...');
+            pendingUploads.delete(uploadId);
+            clearUploadSession(chatId, pending.userId, false);
+            cleanupUploadFile(pending.localPath);
+            return;
+        }
+
         // 处理分页命令
         if (data.startsWith('cmd_listchars_')) {
             const page = parseInt(data.replace('cmd_listchars_', ''));
-            handleTelegramCommand('listchars', [page.toString()], chatId);
+            handleTelegramCommand('listchars', [page.toString()], chatId, userId);
             return;
         }
         if (data.startsWith('cmd_listchats_')) {
             const page = parseInt(data.replace('cmd_listchats_', ''));
-            handleTelegramCommand('listchats', [page.toString()], chatId);
+            handleTelegramCommand('listchats', [page.toString()], chatId, userId);
             return;
         }
 
@@ -1297,7 +1971,14 @@ bot.on('callback_query', async (callbackQuery) => {
             case 'ping':
             case 'reload':
             case 'helptext':
-                handleTelegramCommand(command, [], chatId);
+            case 'models':
+            case 'presets':
+            case 'profiles':
+            case 'providers':
+            case 'provider_models':
+            case 'provider-models':
+            case 'bridge_status':
+                handleTelegramCommand(command, [], chatId, userId);
                 break;
             default:
                 bot.sendMessage(chatId, '未知操作');
@@ -1307,7 +1988,7 @@ bot.on('callback_query', async (callbackQuery) => {
 
 // 监听Telegram消息
 
-bot.on('message', (msg) => {
+bot.on('message', async (msg) => {
 
     const chatId = msg.chat.id;
 
@@ -1377,6 +2058,15 @@ bot.on('message', (msg) => {
 
 
 
+    // 处理文件上传（角色卡 / OpenAI 预设导入）
+
+    if (msg.document || msg.photo) {
+
+        if (await handleUploadDocument(msg)) return;
+
+    }
+
+
     if (!text) return;
 
 
@@ -1405,7 +2095,7 @@ bot.on('message', (msg) => {
 
         // 其他命令也由服务器处理，但可能需要前端执行
 
-        handleTelegramCommand(command, args, chatId);
+        handleTelegramCommand(command, args, chatId, userId);
 
         return;
 
