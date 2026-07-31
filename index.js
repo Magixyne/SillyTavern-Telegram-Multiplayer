@@ -1,42 +1,47 @@
 // index.js
+// SillyTavern Telegram Connector (Multiplayer)
+//
+// 合规性说明（依据官方 Writing-Extensions 文档）：
+// - 使用 SillyTavern.getContext() 获取稳定 API（eventSource、extensionSettings 等）
+// - 仅对 getContext() 未暴露的 4 个函数做直接 import（script.js 是官方文档认可的写法）
+// - 使用 hooks.activate 生命周期钩子（onActivate）替代 jQuery 就绪回调
+// - 异步初始化放到 APP_READY 事件之后，避免阻塞应用加载
 
-// 只解构 getContext() 返回的对象中确实存在的属性
-const {
-    extensionSettings,
-    deleteLastMessage, // 导入删除最后一条消息的函数
-    saveSettingsDebounced, // 导入保存设置的函数
-} = SillyTavern.getContext();
-
-// getContext 函数是全局 SillyTavern 对象的一部分，我们不需要从别处导入它
-// 在需要时直接调用 SillyTavern.getContext() 即可
-
-// 从 script.js 导入所有需要的公共API函数
+// 从 script.js 导入 getContext() 未暴露的函数
 import {
-    eventSource,
-    event_types,
-    getPastCharacterChats,
     sendMessageAsUser,
     doNewChat,
-    selectCharacterById,
-    openCharacterChat,
-    Generate,
+    getPastCharacterChats,
     setExternalAbortController,
 } from "../../../../script.js";
 
 const MODULE_NAME = 'SillyTavern-Telegram-Connector';
-const DEFAULT_SETTINGS = {
+
+// 默认设置：Object.freeze 防止意外修改
+const DEFAULT_SETTINGS = Object.freeze({
     bridgeUrl: 'ws://127.0.0.1:2333',
     autoConnect: true,
-};
+    // ---- Multiplayer 设置 ----
+    multiplayerEnabled: false,      // 是否启用群组多人模式
+    userPrefix: '<用户>: ',          // 用户消息前缀格式: '<用户>: ' | '用户: ' | '[用户]: ' | '*用户* '
+    defaultMode: 'instant',          // 默认游戏模式: 'instant'(即时) | 'buffered'(缓冲)
+    bufferWindowSeconds: 30,         // 缓冲模式：收集窗口（秒）
+    bufferMaxMessages: 8,            // 缓冲模式：最多收集消息数，达到立即触发
+});
 
 let ws = null; // WebSocket实例
-let lastProcessedChatId = null; // 用于存储最后处理过的Telegram chatId
+let lastProcessedChatId = null; // 当前正在生成的Telegram chatId
 
-// 添加一个全局变量来跟踪当前是否处于流式模式
-let isStreamingMode = false;
-
-// 添加一个全局变量来跟踪当前是否正在生成回复
+// 生成状态标志
 let isGenerating = false;
+
+// 消息队列：Multiplayer 下生成期间的新消息先入队，回复完成后按序处理
+// 元素: { chatId, text, username, isGroup }
+let messageQueue = [];
+
+// 缓冲模式：收集一段时间内多名玩家的消息，合并成一条发送给 AI
+// 元素: { chatId, parts: [string], timer, lastActivity }
+let buffer = null;
 
 // 心跳超时检测相关变量
 let heartbeatTimeoutTimer = null;
@@ -51,9 +56,17 @@ let reconnectTimer = null;
 let isReconnecting = false;
 
 // --- 工具函数 ---
+
 function getSettings() {
+    const { extensionSettings } = SillyTavern.getContext();
     if (!extensionSettings[MODULE_NAME]) {
-        extensionSettings[MODULE_NAME] = { ...DEFAULT_SETTINGS };
+        extensionSettings[MODULE_NAME] = structuredClone(DEFAULT_SETTINGS);
+    }
+    // 确保新增默认键不丢失（升级兼容）
+    for (const key of Object.keys(DEFAULT_SETTINGS)) {
+        if (!Object.hasOwn(extensionSettings[MODULE_NAME], key)) {
+            extensionSettings[MODULE_NAME][key] = DEFAULT_SETTINGS[key];
+        }
     }
     return extensionSettings[MODULE_NAME];
 }
@@ -67,22 +80,39 @@ function updateStatus(message, color) {
 }
 
 /**
+ * 根据设置的用户名前缀格式，为群组消息添加玩家名前缀
+ * @param {string} username - Telegram 用户名
+ * @param {string} text - 原始消息文本
+ * @returns {string} 添加前缀后的文本
+ */
+function applyUserPrefix(username, text) {
+    if (!username) return text;
+    const format = getSettings().userPrefix || '<用户>: ';
+    const displayName = username.startsWith('@') ? username.slice(1) : username;
+    switch (format) {
+        case '用户: ':
+            return `${displayName}: ${text}`;
+        case '[用户]: ':
+            return `[${displayName}]: ${text}`;
+        case '*用户* ':
+            return `*${displayName}* ${text}`;
+        case '<用户>: ':
+        default:
+            return `<${displayName}>: ${text}`;
+    }
+}
+
+/**
  * 重置心跳超时定时器
- * 每次收到心跳消息时调用，重新开始45秒倒计时
  */
 function resetHeartbeatTimeout() {
-    // 清除旧的超时定时器
     if (heartbeatTimeoutTimer) {
         clearTimeout(heartbeatTimeoutTimer);
     }
-
     lastHeartbeatTime = Date.now();
-
-    // 设置新的超时定时器
     heartbeatTimeoutTimer = setTimeout(() => {
         console.log('[Telegram Bridge] 心跳超时，连接可能已断开');
         updateStatus('连接超时', 'red');
-        // 标记连接断开并触发重连
         if (ws) {
             ws.close();
         }
@@ -102,15 +132,9 @@ function clearHeartbeatTimeout() {
 
 /**
  * 处理收到的心跳消息，发送心跳响应
- * @param {Object} data - 心跳消息数据
  */
 function handleHeartbeat(data) {
-    console.log('[Telegram Bridge] 收到心跳包');
-
-    // 重置超时定时器
     resetHeartbeatTimeout();
-
-    // 发送心跳响应
     if (ws && ws.readyState === WebSocket.OPEN) {
         ws.send(JSON.stringify({
             type: 'heartbeat_ack',
@@ -120,33 +144,23 @@ function handleHeartbeat(data) {
 }
 
 /**
- * 尝试自动重连
- * 最多重试3次，每次间隔5秒
+ * 尝试自动重连（最多3次，间隔5秒）
  */
 function attemptReconnect() {
-    // 如果已经在重连中或达到最大重试次数，则不再尝试
-    if (isReconnecting) {
-        return;
-    }
-
+    if (isReconnecting) return;
     if (reconnectAttempts >= MAX_RECONNECT_ATTEMPTS) {
         console.log('[Telegram Bridge] 已达到最大重连次数，停止重连');
         updateStatus('重连失败', 'red');
         reconnectAttempts = 0;
         return;
     }
-
     isReconnecting = true;
     reconnectAttempts++;
-
     console.log(`[Telegram Bridge] 将在${RECONNECT_DELAY / 1000}秒后尝试重连 (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`);
     updateStatus(`重连中... (${reconnectAttempts}/${MAX_RECONNECT_ATTEMPTS})`, 'orange');
-
-    // 清除可能存在的旧重连定时器
     if (reconnectTimer) {
         clearTimeout(reconnectTimer);
     }
-
     reconnectTimer = setTimeout(() => {
         isReconnecting = false;
         console.log(`[Telegram Bridge] 正在尝试第${reconnectAttempts}次重连...`);
@@ -154,10 +168,6 @@ function attemptReconnect() {
     }, RECONNECT_DELAY);
 }
 
-/**
- * 重置重连状态
- * 连接成功时调用
- */
 function resetReconnectState() {
     reconnectAttempts = 0;
     isReconnecting = false;
@@ -167,10 +177,6 @@ function resetReconnectState() {
     }
 }
 
-/**
- * 取消重连
- * 手动断开连接时调用
- */
 function cancelReconnect() {
     resetReconnectState();
     console.log('[Telegram Bridge] 已取消自动重连');
@@ -179,21 +185,211 @@ function cancelReconnect() {
 function reloadPage() {
     window.location.reload();
 }
-// ---
 
-// 连接到WebSocket服务器
+// --- Multiplayer 消息队列 ---
+
+/**
+ * 新消息入口：生成中则入队，否则立即处理
+ * @param {object} item - { chatId, text, username, isGroup }
+ */
+function enqueueOrProcess(item) {
+    if (isGenerating) {
+        messageQueue.push(item);
+        console.log(`[Telegram Bridge] 正在生成回复，消息已入队。队列长度: ${messageQueue.length}`);
+        // 即时模式下给玩家一个提示（缓冲模式静默收集）
+        if (getSettings().defaultMode === 'instant' && ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'ai_reply',
+                chatId: item.chatId,
+                text: '⏳ AI正在生成回复中，您的消息已加入队列，将在当前回复完成后处理。',
+            }));
+        }
+        return;
+    }
+    processMessage(item);
+}
+
+/**
+ * 处理队列中的下一条消息
+ */
+function processNextFromQueue() {
+    const next = messageQueue.shift();
+    if (!next) return;
+    console.log(`[Telegram Bridge] 处理队列消息，剩余队列长度: ${messageQueue.length}`);
+    processMessage(next);
+}
+
+/**
+ * 缓冲模式：把玩家消息加入缓冲区
+ */
+function addToBuffer(item) {
+    if (!buffer || buffer.chatId !== item.chatId) {
+        // 已有其他群组的缓冲，先冲刷
+        if (buffer) flushBuffer();
+        buffer = { chatId: item.chatId, parts: [], timer: null };
+    }
+    const prefixed = item.isGroup ? applyUserPrefix(item.username, item.text) : item.text;
+    buffer.parts.push(prefixed);
+    buffer.lastActivity = Date.now();
+    console.log(`[Telegram Bridge] 缓冲消息 (${buffer.parts.length}/${getSettings().bufferMaxMessages})，来自: ${item.username || '未知用户'}`);
+
+    // 达到最大条数，立即触发
+    if (buffer.parts.length >= getSettings().bufferMaxMessages) {
+        flushBuffer();
+        return;
+    }
+    // 重置窗口定时器
+    if (buffer.timer) clearTimeout(buffer.timer);
+    buffer.timer = setTimeout(flushBuffer, (getSettings().bufferWindowSeconds || 30) * 1000);
+}
+
+/**
+ * 冲刷缓冲区：把收集到的多条玩家消息合并为一条发送给 AI
+ */
+function flushBuffer() {
+    if (!buffer) return;
+    const b = buffer;
+    buffer = null;
+    if (b.timer) clearTimeout(b.timer);
+    const text = b.parts.join('\n');
+    console.log(`[Telegram Bridge] 冲刷缓冲区 (${b.parts.length} 条消息) → 发送给 AI`);
+    enqueueOrProcess({ chatId: b.chatId, text, username: null, isGroup: false });
+}
+
+/**
+ * 实际处理一条（或一批）玩家消息：注入 ST 并触发生成
+ * @param {object} item - { chatId, text, username, isGroup }
+ */
+async function processMessage(item) {
+    const { eventSource, event_types, generate } = SillyTavern.getContext();
+
+    // 标记开始生成
+    isGenerating = true;
+    lastProcessedChatId = item.chatId;
+
+    // 1. 立即向Telegram发送"输入中"状态
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'typing_action', chatId: item.chatId }));
+    }
+
+    // 2. 将用户消息添加到SillyTavern
+    //    - Multiplayer 且来自群组时，添加玩家名前缀
+    //    - 缓冲模式冲刷出的合并消息（username=null）不再重复加前缀
+    let messageText = item.text;
+    if (item.username && item.isGroup && getSettings().multiplayerEnabled) {
+        messageText = applyUserPrefix(item.username, item.text);
+    }
+    try {
+        await sendMessageAsUser(messageText);
+    } catch (err) {
+        console.error('[Telegram Bridge] sendMessageAsUser() 错误:', err);
+        isGenerating = false;
+        lastProcessedChatId = null;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'error_message',
+                chatId: item.chatId,
+                text: `抱歉，消息注入失败: ${err.message || '未知错误'}`,
+            }));
+        }
+        setTimeout(processNextFromQueue, 200);
+        return;
+    }
+
+    // 3. 设置流式传输的回调
+    const streamCallback = (...args) => {
+        let cumulativeText = '';
+        if (typeof args[0] === 'string') {
+            cumulativeText = args[0];
+        } else if (args[0] && typeof args[0].text === 'string') {
+            cumulativeText = args[0].text;
+        } else if (args[0] && typeof args[0].message === 'string') {
+            cumulativeText = args[0].message;
+        }
+        if (ws && ws.readyState === WebSocket.OPEN && cumulativeText) {
+            ws.send(JSON.stringify({
+                type: 'stream_chunk',
+                chatId: item.chatId,
+                text: cumulativeText,
+            }));
+        }
+    };
+    eventSource.on(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
+
+    // 4. 清理函数：生成结束（成功/失败/手动停止）后执行
+    const cleanup = () => {
+        eventSource.removeListener(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            if (!item.error) {
+                ws.send(JSON.stringify({ type: 'stream_end', chatId: item.chatId }));
+            }
+        }
+    };
+
+    // 5. 监听生成结束事件（once，避免干扰后续消息）
+    //    注意：Generate 报错时 GENERATION_ENDED 也会触发，且 catch 分支也会走到这里，
+    //    因此用 nextScheduled 标志保证队列只被调度一次，避免并发处理两条消息。
+    let nextScheduled = false;
+    const scheduleNextOnce = () => {
+        if (nextScheduled) return;
+        nextScheduled = true;
+        isGenerating = false;
+        lastProcessedChatId = null;
+        // 等 handleFinalMessage 的 DOM 提取完成（约100ms）后再处理下一条
+        setTimeout(processNextFromQueue, 250);
+    };
+    const scheduleNext = () => {
+        cleanup();
+        scheduleNextOnce();
+    };
+    eventSource.once(event_types.GENERATION_ENDED, scheduleNext);
+    eventSource.once(event_types.GENERATION_STOPPED, scheduleNext);
+
+    // 6. 触发生成
+    try {
+        const abortController = new AbortController();
+        setExternalAbortController(abortController);
+        await generate('normal', { signal: abortController.signal });
+    } catch (error) {
+        console.error("[Telegram Bridge] generate() 错误:", error);
+        item.error = true;
+
+        // a. 从聊天记录中删除导致错误的用户消息
+        try {
+            const { deleteLastMessage } = SillyTavern.getContext();
+            await deleteLastMessage();
+            console.log('[Telegram Bridge] 已删除导致错误的用户消息。');
+        } catch (delErr) {
+            console.error('[Telegram Bridge] 删除消息失败:', delErr);
+        }
+
+        // b. 发送错误信息
+        const errorMessage = `抱歉，AI生成回复时遇到错误。\n您的上一条消息已被撤回，请重试或发送不同内容。\n\n错误详情: ${error.message || '未知错误'}`;
+        if (ws && ws.readyState === WebSocket.OPEN) {
+            ws.send(JSON.stringify({
+                type: 'error_message',
+                chatId: item.chatId,
+                text: errorMessage,
+            }));
+        }
+
+        // 清理并调度下一条（nextScheduled 保证只调度一次）
+        scheduleNext();
+    }
+}
+
+// --- WebSocket 连接 ---
+
 function connect() {
     if (ws && ws.readyState === WebSocket.OPEN) {
         console.log('[Telegram Bridge] 已连接');
         return;
     }
-
     const settings = getSettings();
     if (!settings.bridgeUrl) {
         updateStatus('URL 未设置！', 'red');
         return;
     }
-
     updateStatus('连接中...', 'orange');
     console.log(`[Telegram Bridge] 正在连接 ${settings.bridgeUrl}...`);
 
@@ -202,9 +398,7 @@ function connect() {
     ws.onopen = () => {
         console.log('[Telegram Bridge] 连接成功！');
         updateStatus('已连接', 'green');
-        // 重置重连状态
         resetReconnectState();
-        // 启动心跳超时检测
         resetHeartbeatTimeout();
     };
 
@@ -223,112 +417,23 @@ function connect() {
             if (data.type === 'user_message') {
                 console.log('[Telegram Bridge] 收到用户消息。', data);
 
-                // 检查是否正在生成回复，如果是则拦截消息
-                if (isGenerating) {
-                    console.log('[Telegram Bridge] 正在生成回复中，拦截新消息');
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({
-                            type: 'ai_reply',
-                            chatId: data.chatId,
-                            text: '⏳ AI正在生成回复中，请稍候...\n您的消息将在当前回复完成后处理。',
-                        }));
-                    }
+                const item = {
+                    chatId: data.chatId,
+                    text: data.text,
+                    username: data.username || null,
+                    isGroup: data.isGroup === true,
+                };
+
+                const settings = getSettings();
+
+                // 缓冲模式：群组多人消息先进缓冲区
+                if (settings.multiplayerEnabled && settings.defaultMode === 'buffered' && item.isGroup) {
+                    addToBuffer(item);
                     return;
                 }
 
-                // 标记开始生成
-                isGenerating = true;
-
-                // 存储当前处理的chatId
-                lastProcessedChatId = data.chatId;
-
-                // 默认情况下，假设不是流式模式
-                isStreamingMode = false;
-
-                // 1. 立即向Telegram发送“输入中”状态（无论是否流式）
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    ws.send(JSON.stringify({ type: 'typing_action', chatId: data.chatId }));
-                }
-
-                // 2. 将用户消息添加到SillyTavern
-                await sendMessageAsUser(data.text);
-
-                // 3. 设置流式传输的回调
-                const streamCallback = (...args) => {
-                    // 调试：打印接收到的参数
-                    console.log('[Telegram Bridge] STREAM_TOKEN_RECEIVED 参数:', args);
-
-                    // 标记为流式模式
-                    isStreamingMode = true;
-
-                    // 获取累计文本 - 尝试多种可能的参数格式
-                    let cumulativeText = '';
-                    if (typeof args[0] === 'string') {
-                        cumulativeText = args[0];
-                    } else if (args[0] && typeof args[0].text === 'string') {
-                        cumulativeText = args[0].text;
-                    } else if (args[0] && typeof args[0].message === 'string') {
-                        cumulativeText = args[0].message;
-                    }
-
-                    // 将每个文本块通过WebSocket发送到服务端
-                    if (ws && ws.readyState === WebSocket.OPEN && cumulativeText) {
-                        ws.send(JSON.stringify({
-                            type: 'stream_chunk',
-                            chatId: data.chatId,
-                            text: cumulativeText,
-                        }));
-                    }
-                };
-                eventSource.on(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
-
-                // 4. 定义一个清理函数
-                const cleanup = () => {
-                    eventSource.removeListener(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
-                    if (ws && ws.readyState === WebSocket.OPEN && isStreamingMode) {
-                        // 仅在没有错误且确实处于流式模式时发送stream_end
-                        if (!data.error) {
-                            ws.send(JSON.stringify({ type: 'stream_end', chatId: data.chatId }));
-                        }
-                    }
-                    // 注意：不在这里重置isStreamingMode，让handleFinalMessage函数来处理
-                    // 重置生成状态标志
-                    isGenerating = false;
-                };
-
-                // 5. 监听生成结束事件，确保无论成功与否都执行清理
-                // 注意: 我们现在使用once来确保这个监听器只执行一次，避免干扰后续的全局监听器
-                eventSource.once(event_types.GENERATION_ENDED, cleanup);
-                // 添加对手动停止生成的处理
-                eventSource.once(event_types.GENERATION_STOPPED, cleanup);
-
-                // 6. 触发SillyTavern的生成流程，并用try...catch包裹
-                try {
-                    const abortController = new AbortController();
-                    setExternalAbortController(abortController);
-                    await Generate('normal', { signal: abortController.signal });
-                } catch (error) {
-                    console.error("[Telegram Bridge] Generate() 错误:", error);
-
-                    // a. 从SillyTavern聊天记录中删除导致错误的用户消息
-                    await deleteLastMessage();
-                    console.log('[Telegram Bridge] 已删除导致错误的用户消息。');
-
-                    // b. 准备并发送错误信息到服务端
-                    const errorMessage = `抱歉，AI生成回复时遇到错误。\n您的上一条消息已被撤回，请重试或发送不同内容。\n\n错误详情: ${error.message || '未知错误'}`;
-                    if (ws && ws.readyState === WebSocket.OPEN) {
-                        ws.send(JSON.stringify({
-                            type: 'error_message',
-                            chatId: data.chatId,
-                            text: errorMessage,
-                        }));
-                    }
-
-                    // c. 标记错误以便cleanup函数知道
-                    data.error = true;
-                    cleanup(); // 确保清理监听器
-                }
-
+                // 即时模式（或非群组/未启用多人）：入队或直接处理
+                enqueueOrProcess(item);
                 return;
             }
 
@@ -345,215 +450,10 @@ function connect() {
             // --- 执行命令处理 ---
             if (data.type === 'execute_command') {
                 console.log('[Telegram Bridge] 执行命令', data);
-
-                // 显示“输入中”状态
                 if (ws && ws.readyState === WebSocket.OPEN) {
                     ws.send(JSON.stringify({ type: 'typing_action', chatId: data.chatId }));
                 }
-
-                let replyText = '命令执行失败，请稍后重试。';
-
-                // 直接调用全局的 SillyTavern.getContext()
-                const context = SillyTavern.getContext();
-                let commandSuccess = false;
-
-                try {
-                    switch (data.command) {
-                        case 'new':
-                            await doNewChat({ deleteCurrentChat: false });
-                            replyText = '新的聊天已经开始。';
-                            commandSuccess = true;
-                            break;
-                        case 'listchars': {
-                            const characters = context.characters.slice(1);
-                            if (characters.length > 0) {
-                                // 分页参数：每页显示10个角色（避免消息过长）
-                                const PAGE_SIZE = 10;
-                                const pageArg = data.args && data.args[0] ? parseInt(data.args[0]) : 1;
-                                const page = isNaN(pageArg) ? 1 : pageArg;
-                                const totalPages = Math.ceil(characters.length / PAGE_SIZE);
-                                const currentPage = Math.max(1, Math.min(page, totalPages));
-                                const startIndex = (currentPage - 1) * PAGE_SIZE;
-                                const endIndex = Math.min(startIndex + PAGE_SIZE, characters.length);
-                                const pageChars = characters.slice(startIndex, endIndex);
-
-                                replyText = `📋 角色 (${currentPage}/${totalPages}页)\n`;
-                                pageChars.forEach((char, index) => {
-                                    const globalIndex = startIndex + index + 1;
-                                    // 截断过长的角色名
-                                    const charName = char.name.length > 20 ? char.name.substring(0, 20) + '..' : char.name;
-                                    replyText += `${globalIndex}. ${charName}\n`;
-                                });
-                                replyText += `\n切换: /switchchar_数字`;
-
-                                // 发送带分页信息的回复
-                                if (ws && ws.readyState === WebSocket.OPEN) {
-                                    ws.send(JSON.stringify({
-                                        type: 'ai_reply',
-                                        chatId: data.chatId,
-                                        text: replyText,
-                                        pagination: {
-                                            currentPage,
-                                            totalPages,
-                                            type: 'listchars'
-                                        }
-                                    }));
-                                }
-                                return;
-                            } else {
-                                replyText = '没有找到可用角色。';
-                            }
-                            commandSuccess = true;
-                            break;
-                        }
-                        case 'switchchar': {
-                            if (!data.args || data.args.length === 0) {
-                                replyText = '请提供角色名称或序号。用法: /switchchar <角色名称> 或 /switchchar_数字';
-                                break;
-                            }
-                            const targetName = data.args.join(' ');
-                            const characters = context.characters;
-                            const targetChar = characters.find(c => c.name === targetName);
-
-                            if (targetChar) {
-                                const charIndex = characters.indexOf(targetChar);
-                                await selectCharacterById(charIndex);
-                                replyText = `已成功切换到角色 "${targetName}"。`;
-                                commandSuccess = true;
-                            } else {
-                                replyText = `角色 "${targetName}" 未找到。`;
-                            }
-                            break;
-                        }
-                        case 'listchats': {
-                            if (context.characterId === undefined) {
-                                replyText = '请先选择一个角色。';
-                                break;
-                            }
-                            const chatFiles = await getPastCharacterChats(context.characterId);
-                            if (chatFiles.length > 0) {
-                                // 分页参数：每页显示10个聊天记录
-                                const CHAT_PAGE_SIZE = 10;
-                                const chatPageArg = data.args && data.args[0] ? parseInt(data.args[0]) : 1;
-                                const chatPage = isNaN(chatPageArg) ? 1 : chatPageArg;
-                                const chatTotalPages = Math.ceil(chatFiles.length / CHAT_PAGE_SIZE);
-                                const chatCurrentPage = Math.max(1, Math.min(chatPage, chatTotalPages));
-                                const chatStartIndex = (chatCurrentPage - 1) * CHAT_PAGE_SIZE;
-                                const chatEndIndex = Math.min(chatStartIndex + CHAT_PAGE_SIZE, chatFiles.length);
-                                const pageChats = chatFiles.slice(chatStartIndex, chatEndIndex);
-
-                                replyText = `💬 聊天 (${chatCurrentPage}/${chatTotalPages}页)\n`;
-                                pageChats.forEach((chat, index) => {
-                                    const globalIndex = chatStartIndex + index + 1;
-                                    let chatName = chat.file_name.replace('.jsonl', '');
-                                    // 截断过长的聊天名
-                                    chatName = chatName.length > 20 ? chatName.substring(0, 20) + '..' : chatName;
-                                    replyText += `${globalIndex}. ${chatName}\n`;
-                                });
-                                replyText += `\n切换: /switchchat_数字`;
-
-                                // 发送带分页信息的回复
-                                if (ws && ws.readyState === WebSocket.OPEN) {
-                                    ws.send(JSON.stringify({
-                                        type: 'ai_reply',
-                                        chatId: data.chatId,
-                                        text: replyText,
-                                        pagination: {
-                                            currentPage: chatCurrentPage,
-                                            totalPages: chatTotalPages,
-                                            type: 'listchats'
-                                        }
-                                    }));
-                                }
-                                return;
-                            } else {
-                                replyText = '当前角色没有任何聊天记录。';
-                            }
-                            commandSuccess = true;
-                            break;
-                        }
-                        case 'switchchat': {
-                            if (!data.args || data.args.length === 0) {
-                                replyText = '请提供聊天记录名称。用法： /switchchat <聊天记录名称>';
-                                break;
-                            }
-                            const targetChatFile = `${data.args.join(' ')}`;
-                            try {
-                                await openCharacterChat(targetChatFile);
-                                replyText = `已加载聊天记录： ${targetChatFile}`;
-                                commandSuccess = true;
-                            } catch (err) {
-                                console.error(err);
-                                replyText = `加载聊天记录 "${targetChatFile}" 失败。请确认名称完全正确。`;
-                            }
-                            break;
-                        }
-                        default: {
-                            // 处理特殊格式的命令，如 switchchar_1, switchchat_2 等
-                            const charMatch = data.command.match(/^switchchar_(\d+)$/);
-                            if (charMatch) {
-                                const index = parseInt(charMatch[1]) - 1;
-                                const characters = context.characters.slice(1);
-                                if (index >= 0 && index < characters.length) {
-                                    const targetChar = characters[index];
-                                    const charIndex = context.characters.indexOf(targetChar);
-                                    await selectCharacterById(charIndex);
-                                    replyText = `已切换到角色 "${targetChar.name}"。`;
-                                    commandSuccess = true;
-                                } else {
-                                    replyText = `无效的角色序号: ${index + 1}。请使用 /listchars 查看可用角色。`;
-                                }
-                                break;
-                            }
-
-                            const chatMatch = data.command.match(/^switchchat_(\d+)$/);
-                            if (chatMatch) {
-                                if (context.characterId === undefined) {
-                                    replyText = '请先选择一个角色。';
-                                    break;
-                                }
-                                const index = parseInt(chatMatch[1]) - 1;
-                                const chatFiles = await getPastCharacterChats(context.characterId);
-
-                                if (index >= 0 && index < chatFiles.length) {
-                                    const targetChat = chatFiles[index];
-                                    const chatName = targetChat.file_name.replace('.jsonl', '');
-                                    try {
-                                        await openCharacterChat(chatName);
-                                        replyText = `已加载聊天记录： ${chatName}`;
-                                        commandSuccess = true;
-                                    } catch (err) {
-                                        console.error(err);
-                                        replyText = `加载聊天记录失败。`;
-                                    }
-                                } else {
-                                    replyText = `无效的聊天记录序号: ${index + 1}。请使用 /listchats 查看可用聊天记录。`;
-                                }
-                                break;
-                            }
-
-                            replyText = `未知命令: /${data.command}。使用 /help 查看所有命令。`;
-                        }
-                    }
-                } catch (error) {
-                    console.error('[Telegram Bridge] 执行命令时出错:', error);
-                    replyText = `执行命令时出错: ${error.message || '未知错误'}`;
-                }
-
-                // 发送命令执行结果
-                if (ws && ws.readyState === WebSocket.OPEN) {
-                    // 发送命令执行结果到Telegram
-                    ws.send(JSON.stringify({ type: 'ai_reply', chatId: data.chatId, text: replyText }));
-
-                    // 发送命令执行状态反馈到服务器
-                    ws.send(JSON.stringify({
-                        type: 'command_executed',
-                        command: data.command,
-                        success: commandSuccess,
-                        message: replyText
-                    }));
-                }
-
+                await handleExecuteCommand(data);
                 return;
             }
         } catch (error) {
@@ -566,11 +466,8 @@ function connect() {
 
     ws.onclose = () => {
         console.log('[Telegram Bridge] 连接已关闭。');
-        // 清除心跳超时定时器
         clearHeartbeatTimeout();
         ws = null;
-
-        // 如果启用了自动连接，尝试重连
         const settings = getSettings();
         if (settings.autoConnect && !isReconnecting) {
             updateStatus('连接已断开，准备重连...', 'orange');
@@ -582,73 +479,216 @@ function connect() {
 
     ws.onerror = (error) => {
         console.error('[Telegram Bridge] WebSocket 错误：', error);
-        // 清除心跳超时定时器
         clearHeartbeatTimeout();
-        // 注意：onerror后通常会触发onclose，所以这里不需要重复触发重连
-        // 只更新状态，让onclose处理重连逻辑
         updateStatus('连接错误', 'red');
     };
 }
 
 function disconnect() {
-    // 取消自动重连
     cancelReconnect();
     if (ws) {
         ws.close();
     }
 }
 
-// 扩展加载时执行的函数
-jQuery(async () => {
-    console.log('[Telegram Bridge] 正在尝试加载设置 UI...');
-    try {
-        const settingsHtml = await $.get(`/scripts/extensions/third-party/${MODULE_NAME}/settings.html`);
-        $('#extensions_settings').append(settingsHtml);
-        console.log('[Telegram Bridge] 设置 UI 应该已经被添加。');
-
-        const settings = getSettings();
-        $('#telegram_bridge_url').val(settings.bridgeUrl);
-        $('#telegram_auto_connect').prop('checked', settings.autoConnect);
-
-        $('#telegram_bridge_url').on('input', () => {
-            const settings = getSettings();
-            settings.bridgeUrl = $('#telegram_bridge_url').val();
-            // 确保调用saveSettingsDebounced保存设置
-            saveSettingsDebounced();
-        });
-
-        $('#telegram_auto_connect').on('change', function () {
-            const settings = getSettings();
-            settings.autoConnect = $(this).prop('checked');
-            // 确保调用saveSettingsDebounced保存设置
-            console.log(`[Telegram Bridge] 自动连接设置已更改为: ${settings.autoConnect}`);
-            saveSettingsDebounced();
-        });
-
-        $('#telegram_connect_button').on('click', connect);
-        $('#telegram_disconnect_button').on('click', disconnect);
-
-        if (settings.autoConnect) {
-            console.log('[Telegram Bridge] 自动连接已启用，正在连接...');
-            connect();
-        }
-
-    } catch (error) {
-        console.error('[Telegram Bridge] 加载设置 HTML 失败。', error);
-    }
-    console.log('[Telegram Bridge] 扩展已加载。');
-});
-
 /**
- * 从DOM元素中提取文本，保留换行符和基本格式标记
- * @param {jQuery} messageTextElement - 消息文本的jQuery元素
- * @returns {string} 提取的文本，保留格式标记
+ * 执行来自 Telegram 的命令（角色/聊天管理）
  */
-function extractTextFromDOM(messageTextElement) {
-    // 克隆元素以避免修改原始DOM
-    const clone = messageTextElement.clone();
+async function handleExecuteCommand(data) {
+    const {
+        characters,
+        characterId,
+        selectCharacterById,
+        openCharacterChat,
+    } = SillyTavern.getContext();
 
-    // 处理换行相关标签
+    let replyText = '命令执行失败，请稍后重试。';
+    let commandSuccess = false;
+
+    try {
+        switch (data.command) {
+            case 'new':
+                await doNewChat({ deleteCurrentChat: false });
+                replyText = '新的聊天已经开始。';
+                commandSuccess = true;
+                break;
+
+            case 'listchars': {
+                const charList = characters.slice(1);
+                if (charList.length > 0) {
+                    const PAGE_SIZE = 10;
+                    const pageArg = data.args && data.args[0] ? parseInt(data.args[0]) : 1;
+                    const page = isNaN(pageArg) ? 1 : pageArg;
+                    const totalPages = Math.ceil(charList.length / PAGE_SIZE);
+                    const currentPage = Math.max(1, Math.min(page, totalPages));
+                    const startIndex = (currentPage - 1) * PAGE_SIZE;
+                    const endIndex = Math.min(startIndex + PAGE_SIZE, charList.length);
+                    const pageChars = charList.slice(startIndex, endIndex);
+
+                    replyText = `📋 角色 (${currentPage}/${totalPages}页)\n`;
+                    pageChars.forEach((char, index) => {
+                        const globalIndex = startIndex + index + 1;
+                        const charName = char.name.length > 20 ? char.name.substring(0, 20) + '..' : char.name;
+                        replyText += `${globalIndex}. ${charName}\n`;
+                    });
+                    replyText += `\n切换: /switchchar_数字`;
+
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            type: 'ai_reply',
+                            chatId: data.chatId,
+                            text: replyText,
+                            pagination: { currentPage, totalPages, type: 'listchars' }
+                        }));
+                    }
+                    return;
+                }
+                replyText = '没有找到可用角色。';
+                commandSuccess = true;
+                break;
+            }
+
+            case 'switchchar': {
+                if (!data.args || data.args.length === 0) {
+                    replyText = '请提供角色名称或序号。用法: /switchchar <角色名称> 或 /switchchar_数字';
+                    break;
+                }
+                const targetName = data.args.join(' ');
+                const targetChar = characters.find(c => c.name === targetName);
+                if (targetChar) {
+                    const charIndex = characters.indexOf(targetChar);
+                    await selectCharacterById(charIndex);
+                    replyText = `已成功切换到角色 "${targetName}"。`;
+                    commandSuccess = true;
+                } else {
+                    replyText = `角色 "${targetName}" 未找到。`;
+                }
+                break;
+            }
+
+            case 'listchats': {
+                if (characterId === undefined) {
+                    replyText = '群组聊天中不可用，请先单独选择一个角色。';
+                    break;
+                }
+                const chatFiles = await getPastCharacterChats(characterId);
+                if (chatFiles.length > 0) {
+                    const CHAT_PAGE_SIZE = 10;
+                    const chatPageArg = data.args && data.args[0] ? parseInt(data.args[0]) : 1;
+                    const chatPage = isNaN(chatPageArg) ? 1 : chatPageArg;
+                    const chatTotalPages = Math.ceil(chatFiles.length / CHAT_PAGE_SIZE);
+                    const chatCurrentPage = Math.max(1, Math.min(chatPage, chatTotalPages));
+                    const chatStartIndex = (chatCurrentPage - 1) * CHAT_PAGE_SIZE;
+                    const chatEndIndex = Math.min(chatStartIndex + CHAT_PAGE_SIZE, chatFiles.length);
+                    const pageChats = chatFiles.slice(chatStartIndex, chatEndIndex);
+
+                    replyText = `💬 聊天 (${chatCurrentPage}/${chatTotalPages}页)\n`;
+                    pageChats.forEach((chat, index) => {
+                        const globalIndex = chatStartIndex + index + 1;
+                        let chatName = chat.file_name.replace('.jsonl', '');
+                        chatName = chatName.length > 20 ? chatName.substring(0, 20) + '..' : chatName;
+                        replyText += `${globalIndex}. ${chatName}\n`;
+                    });
+                    replyText += `\n切换: /switchchat_数字`;
+
+                    if (ws && ws.readyState === WebSocket.OPEN) {
+                        ws.send(JSON.stringify({
+                            type: 'ai_reply',
+                            chatId: data.chatId,
+                            text: replyText,
+                            pagination: { currentPage: chatCurrentPage, totalPages: chatTotalPages, type: 'listchats' }
+                        }));
+                    }
+                    return;
+                }
+                replyText = '当前角色没有任何聊天记录。';
+                commandSuccess = true;
+                break;
+            }
+
+            case 'switchchat': {
+                if (!data.args || data.args.length === 0) {
+                    replyText = '请提供聊天记录名称。用法： /switchchat <聊天记录名称>';
+                    break;
+                }
+                const targetChatFile = data.args.join(' ');
+                try {
+                    await openCharacterChat(targetChatFile);
+                    replyText = `已加载聊天记录： ${targetChatFile}`;
+                    commandSuccess = true;
+                } catch (err) {
+                    console.error(err);
+                    replyText = `加载聊天记录 "${targetChatFile}" 失败。请确认名称完全正确。`;
+                }
+                break;
+            }
+
+            default: {
+                const charMatch = data.command.match(/^switchchar_(\d+)$/);
+                if (charMatch) {
+                    const index = parseInt(charMatch[1]) - 1;
+                    const charList = characters.slice(1);
+                    if (index >= 0 && index < charList.length) {
+                        const targetChar = charList[index];
+                        const charIndex = characters.indexOf(targetChar);
+                        await selectCharacterById(charIndex);
+                        replyText = `已切换到角色 "${targetChar.name}"。`;
+                        commandSuccess = true;
+                    } else {
+                        replyText = `无效的角色序号: ${index + 1}。请使用 /listchars 查看可用角色。`;
+                    }
+                    break;
+                }
+
+                const chatMatch = data.command.match(/^switchchat_(\d+)$/);
+                if (chatMatch) {
+                    if (characterId === undefined) {
+                        replyText = '群组聊天中不可用，请先单独选择一个角色。';
+                        break;
+                    }
+                    const index = parseInt(chatMatch[1]) - 1;
+                    const chatFiles = await getPastCharacterChats(characterId);
+                    if (index >= 0 && index < chatFiles.length) {
+                        const targetChat = chatFiles[index];
+                        const chatName = targetChat.file_name.replace('.jsonl', '');
+                        try {
+                            await openCharacterChat(chatName);
+                            replyText = `已加载聊天记录： ${chatName}`;
+                            commandSuccess = true;
+                        } catch (err) {
+                            console.error(err);
+                            replyText = '加载聊天记录失败。';
+                        }
+                    } else {
+                        replyText = `无效的聊天记录序号: ${index + 1}。请使用 /listchats 查看可用聊天记录。`;
+                    }
+                    break;
+                }
+
+                replyText = `未知命令: /${data.command}。使用 /help 查看所有命令。`;
+            }
+        }
+    } catch (error) {
+        console.error('[Telegram Bridge] 执行命令时出错:', error);
+        replyText = `执行命令时出错: ${error.message || '未知错误'}`;
+    }
+
+    // 发送命令执行结果
+    if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'ai_reply', chatId: data.chatId, text: replyText }));
+        ws.send(JSON.stringify({
+            type: 'command_executed',
+            command: data.command,
+            success: commandSuccess,
+            message: replyText
+        }));
+    }
+}
+
+// --- DOM 文本提取（用于获取最终渲染后的消息） ---
+
+function extractTextFromDOM(messageTextElement) {
+    const clone = messageTextElement.clone();
     clone.find('br').replaceWith('\n');
     clone.find('p').each(function () {
         $(this).prepend('\n\n').append('\n\n');
@@ -656,139 +696,107 @@ function extractTextFromDOM(messageTextElement) {
     clone.find('div').each(function () {
         $(this).append('\n');
     });
-
-    // 保留粗体格式标记 - 转换为 **text**
     clone.find('b, strong').each(function () {
         const text = $(this).text();
         $(this).replaceWith(`**${text}**`);
     });
-
-    // 保留斜体格式标记 - 转换为 *text*
     clone.find('i, em').each(function () {
         const text = $(this).text();
         $(this).replaceWith(`*${text}*`);
     });
-
-    // 保留代码块格式 - 转换为 `code` 或 ```code```
     clone.find('code').each(function () {
         const text = $(this).text();
-        // 检查是否是多行代码块
         if (text.includes('\n')) {
             $(this).replaceWith(`\`\`\`\n${text}\n\`\`\``);
         } else {
             $(this).replaceWith(`\`${text}\``);
         }
     });
-
     clone.find('pre').each(function () {
         const text = $(this).text();
         $(this).replaceWith(`\`\`\`\n${text}\n\`\`\``);
     });
-
-    // 获取处理后的文本内容
     let text = clone.text();
-
-    // 解码HTML实体
     text = decodeHtmlEntities(text);
-
-    // 清理多余的空行（超过2个连续换行符的替换为2个）
     text = text.replace(/\n{3,}/g, '\n\n');
-
-    // 去除首尾空白
-    text = text.trim();
-
-    return text;
+    return text.trim();
 }
 
-/**
- * 解码HTML实体
- * @param {string} text - 包含HTML实体的文本
- * @returns {string} 解码后的文本
- */
 function decodeHtmlEntities(text) {
     const tempDiv = document.createElement('div');
     tempDiv.innerHTML = text;
     return tempDiv.textContent || tempDiv.innerText || '';
 }
 
-// 全局事件监听器，用于最终消息更新
-function handleFinalMessage(lastMessageIdInChatArray) {
-    console.log(`[Telegram Bridge] handleFinalMessage 被调用, lastMessageId: ${lastMessageIdInChatArray}, lastProcessedChatId: ${lastProcessedChatId}, isStreamingMode: ${isStreamingMode}`);
+// --- 最终消息处理 ---
 
-    // 确保WebSocket已连接，并且我们有一个有效的chatId来发送更新
+function handleFinalMessage(lastMessageIdInChatArray) {
+    console.log(`[Telegram Bridge] handleFinalMessage 被调用, lastMessageId: ${lastMessageIdInChatArray}, lastProcessedChatId: ${lastProcessedChatId}`);
+
     if (!ws || ws.readyState !== WebSocket.OPEN || !lastProcessedChatId) {
-        console.log('[Telegram Bridge] handleFinalMessage 提前返回: ws状态或chatId无效');
         return;
     }
 
-    const lastMessageIndex = lastMessageIdInChatArray - 1;
+    // GENERATION_ENDED 传 chat.length；GENERATION_STOPPED 不传参数，回退到 chat 数组
+    let lastMessageIndex;
+    if (typeof lastMessageIdInChatArray === 'number' && lastMessageIdInChatArray > 0) {
+        lastMessageIndex = lastMessageIdInChatArray - 1;
+    } else {
+        const currentChat = SillyTavern.getContext().chat;
+        lastMessageIndex = Array.isArray(currentChat) ? currentChat.length - 1 : -1;
+    }
     if (lastMessageIndex < 0) return;
 
-    // 延迟以确保DOM更新完成
+    const chatIdToSend = lastProcessedChatId;
+
     setTimeout(() => {
-        // 直接调用全局的 SillyTavern.getContext()
         const context = SillyTavern.getContext();
         const lastMessage = context.chat[lastMessageIndex];
 
-        // 确认这是我们刚刚通过Telegram触发的AI回复
         if (lastMessage && !lastMessage.is_user && !lastMessage.is_system) {
+            let renderedText = null;
+
+            // 优先从 DOM 提取渲染后的文本（保留格式标记）
             const messageElement = $(`#chat .mes[mesid="${lastMessageIndex}"]`);
-
             if (messageElement.length > 0) {
-                // 获取消息文本元素
                 const messageTextElement = messageElement.find('.mes_text');
-
-                // 使用优化后的DOM文本提取函数
-                const renderedText = extractTextFromDOM(messageTextElement);
-
-                console.log(`[Telegram Bridge] 捕获到最终渲染文本，准备发送更新到 chatId: ${lastProcessedChatId}`);
-
-                // 判断是流式还是非流式响应
-                if (isStreamingMode) {
-                    // 流式响应 - 发送final_message_update
-                    ws.send(JSON.stringify({
-                        type: 'final_message_update',
-                        chatId: lastProcessedChatId,
-                        text: renderedText,
-                    }));
-                    // 重置流式模式标志
-                    isStreamingMode = false;
-                } else {
-                    // 非流式响应 - 直接发送ai_reply
-                    ws.send(JSON.stringify({
-                        type: 'ai_reply',
-                        chatId: lastProcessedChatId,
-                        text: renderedText,
-                    }));
+                if (messageTextElement.length > 0) {
+                    renderedText = extractTextFromDOM(messageTextElement);
                 }
+            }
 
-                // 重置chatId，避免意外更新其他用户的消息
-                lastProcessedChatId = null;
+            // DOM 提取失败时回退到 chat 数组中的原始文本
+            if (!renderedText && typeof lastMessage.mes === 'string') {
+                console.log('[Telegram Bridge] DOM提取失败，回退到 chat 原始文本');
+                renderedText = lastMessage.mes.trim();
+            }
+
+            if (renderedText) {
+                console.log(`[Telegram Bridge] 捕获到最终文本，发送更新到 chatId: ${chatIdToSend}`);
+                ws.send(JSON.stringify({
+                    type: 'final_message_update',
+                    chatId: chatIdToSend,
+                    text: renderedText,
+                }));
             }
         }
-        // 确保重置生成状态标志（无论是否成功发送消息）
-        isGenerating = false;
+
+        // 重置当前会话标识（不管成功与否）
+        if (lastProcessedChatId === chatIdToSend) {
+            lastProcessedChatId = null;
+        }
     }, 100);
 }
 
-// 全局事件监听器，用于最终消息更新
-eventSource.on(event_types.GENERATION_ENDED, handleFinalMessage);
+// --- 会话清理 ---
 
-// 添加对手动停止生成的处理
-eventSource.on(event_types.GENERATION_STOPPED, handleFinalMessage);
-
-/**
- * 清理流式会话状态
- * 当角色或聊天切换时调用，通知Bridge_Server清空旧的流式会话缓存
- */
 function cleanupStreamSession() {
     console.log('[Telegram Bridge] 检测到角色/聊天切换，清理流式会话状态');
-
-    // 重置本地状态
     isGenerating = false;
-    isStreamingMode = false;
-
-    // 如果有正在处理的chatId，发送清理消息到Bridge_Server
+    if (buffer) {
+        if (buffer.timer) clearTimeout(buffer.timer);
+        buffer = null;
+    }
     if (ws && ws.readyState === WebSocket.OPEN && lastProcessedChatId) {
         ws.send(JSON.stringify({
             type: 'cleanup_session',
@@ -796,28 +804,142 @@ function cleanupStreamSession() {
         }));
         console.log(`[Telegram Bridge] 已发送清理消息到 chatId: ${lastProcessedChatId}`);
     }
-
-    // 重置chatId
     lastProcessedChatId = null;
 }
 
-// 监听角色切换事件
-eventSource.on(event_types.CHAT_CHANGED, () => {
-    console.log('[Telegram Bridge] 检测到聊天切换');
-    cleanupStreamSession();
-});
+// --- 设置界面 ---
 
-// 监听聊天加载事件（切换到不同聊天记录时触发）
-eventSource.on(event_types.CHATLOADED, () => {
-    console.log('[Telegram Bridge] 检测到聊天加载');
-    cleanupStreamSession();
-});
+async function loadSettingsUI() {
+    console.log('[Telegram Bridge] 正在尝试加载设置 UI...');
+    const { renderExtensionTemplateAsync } = SillyTavern.getContext();
 
-// 监听角色选择事件
-eventSource.on(event_types.CHARACTER_MESSAGE_RENDERED, () => {
-    // 这个事件在角色消息渲染时触发，可能表示角色切换
-    // 但我们只在有活跃会话时才清理
-    if (lastProcessedChatId) {
-        console.log('[Telegram Bridge] 检测到角色消息渲染，检查是否需要清理');
+    // 从自身模块 URL 推导扩展文件夹名（兼容第三方目录与用户级安装）
+    let settingsHtml = null;
+    try {
+        const url = new URL('.', import.meta.url).href;
+        const match = url.match(/\/scripts\/extensions\/(.+?)\/$/);
+        if (match && renderExtensionTemplateAsync) {
+            const folder = match[1];
+            console.log(`[Telegram Bridge] 扩展文件夹: ${folder}`);
+            settingsHtml = await renderExtensionTemplateAsync(folder, 'settings');
+        }
+    } catch (error) {
+        console.warn('[Telegram Bridge] renderExtensionTemplateAsync 失败，尝试直接加载:', error);
     }
-});
+
+    // 回退：直接 fetch settings.html
+    if (!settingsHtml) {
+        const settingsUrl = new URL('settings.html', import.meta.url).href;
+        const response = await fetch(settingsUrl);
+        settingsHtml = await response.text();
+    }
+
+    $('#extensions_settings').append(settingsHtml);
+    console.log('[Telegram Bridge] 设置 UI 已添加。');
+
+    bindSettingsUI();
+}
+
+function bindSettingsUI() {
+    const settings = getSettings();
+    const { saveSettingsDebounced } = SillyTavern.getContext();
+
+    $('#telegram_bridge_url').val(settings.bridgeUrl);
+    $('#telegram_auto_connect').prop('checked', settings.autoConnect);
+    $('#telegram_multiplayer_enabled').prop('checked', settings.multiplayerEnabled);
+    $('#telegram_user_prefix').val(settings.userPrefix);
+    $('#telegram_default_mode').val(settings.defaultMode);
+    $('#telegram_buffer_window').val(settings.bufferWindowSeconds);
+    $('#telegram_buffer_max').val(settings.bufferMaxMessages);
+
+    $('#telegram_bridge_url').on('input', () => {
+        getSettings().bridgeUrl = $('#telegram_bridge_url').val();
+        saveSettingsDebounced();
+    });
+
+    $('#telegram_auto_connect').on('change', function () {
+        getSettings().autoConnect = $(this).prop('checked');
+        console.log(`[Telegram Bridge] 自动连接设置已更改为: ${getSettings().autoConnect}`);
+        saveSettingsDebounced();
+    });
+
+    $('#telegram_multiplayer_enabled').on('change', function () {
+        getSettings().multiplayerEnabled = $(this).prop('checked');
+        console.log(`[Telegram Bridge] Multiplayer 模式: ${getSettings().multiplayerEnabled ? '启用' : '关闭'}`);
+        // 切换时清空缓冲
+        if (buffer) {
+            if (buffer.timer) clearTimeout(buffer.timer);
+            buffer = null;
+        }
+        saveSettingsDebounced();
+    });
+
+    $('#telegram_user_prefix').on('change', function () {
+        getSettings().userPrefix = $(this).val();
+        console.log(`[Telegram Bridge] 用户前缀格式: ${getSettings().userPrefix}`);
+        saveSettingsDebounced();
+    });
+
+    $('#telegram_default_mode').on('change', function () {
+        getSettings().defaultMode = $(this).val();
+        console.log(`[Telegram Bridge] 默认模式: ${getSettings().defaultMode}`);
+        if (buffer) {
+            if (buffer.timer) clearTimeout(buffer.timer);
+            buffer = null;
+        }
+        saveSettingsDebounced();
+    });
+
+    $('#telegram_buffer_window').on('change', function () {
+        const value = parseInt($(this).val());
+        getSettings().bufferWindowSeconds = isNaN(value) || value <= 0 ? 30 : value;
+        saveSettingsDebounced();
+    });
+
+    $('#telegram_buffer_max').on('change', function () {
+        const value = parseInt($(this).val());
+        getSettings().bufferMaxMessages = isNaN(value) || value <= 0 ? 8 : value;
+        saveSettingsDebounced();
+    });
+
+    $('#telegram_connect_button').on('click', connect);
+    $('#telegram_disconnect_button').on('click', disconnect);
+
+    if (settings.autoConnect) {
+        console.log('[Telegram Bridge] 自动连接已启用，正在连接...');
+        connect();
+    }
+}
+
+// --- 生命周期钩子（官方推荐） ---
+
+export function onActivate() {
+    console.log('[Telegram Bridge] 扩展激活 (onActivate)');
+    const { eventSource, event_types } = SillyTavern.getContext();
+
+    // 全局事件监听器：生成结束后发送最终渲染文本
+    eventSource.on(event_types.GENERATION_ENDED, handleFinalMessage);
+    eventSource.on(event_types.GENERATION_STOPPED, handleFinalMessage);
+
+    // 角色/聊天切换时清理流式会话状态
+    eventSource.on(event_types.CHAT_CHANGED, () => {
+        console.log('[Telegram Bridge] 检测到聊天切换');
+        cleanupStreamSession();
+    });
+
+    // APP_READY 后执行异步初始化（加载设置UI、自动连接）
+    // 用 setTimeout 延迟，避免阻塞 APP_READY 事件处理器
+    // 使用 on + removeListener 而非 once，保证无论 APP_READY 是否已触发过都能执行
+    const onAppReady = () => {
+        eventSource.removeListener(event_types.APP_READY, onAppReady);
+        setTimeout(async () => {
+            try {
+                await loadSettingsUI();
+            } catch (error) {
+                console.error('[Telegram Bridge] 加载设置 UI 失败。', error);
+            }
+            console.log('[Telegram Bridge] 扩展已加载。');
+        }, 0);
+    };
+    eventSource.on(event_types.APP_READY, onAppReady);
+}

@@ -272,6 +272,18 @@ if (process.env.ALLOWED_USER_IDS) {
     }
 }
 
+// 读取 ALLOWED_CHAT_IDS 环境变量 (逗号分隔的聊天/群组ID列表)
+// 群组场景下用于限制机器人只在指定群组/私聊中响应
+if (process.env.ALLOWED_CHAT_IDS) {
+    const envChatIds = process.env.ALLOWED_CHAT_IDS
+        .split(',')
+        .map(id => parseInt(id.trim()))
+        .filter(id => !isNaN(id));
+    if (envChatIds.length > 0) {
+        config.allowedChatIds = envChatIds;
+    }
+}
+
 // 读取 MESSAGE_PARSE_MODE 环境变量
 if (process.env.MESSAGE_PARSE_MODE) {
     const parseMode = process.env.MESSAGE_PARSE_MODE.trim();
@@ -1211,51 +1223,141 @@ bot.on('callback_query', async (callbackQuery) => {
 });
 
 // 监听Telegram消息
-bot.on('message', (msg) => {
-    const chatId = msg.chat.id;
-    const text = msg.text;
-    const userId = msg.from.id;
-    const username = msg.from.username || 'N/A';
 
-    // 检查白名单是否已配置且不为空
-    if (config.allowedUserIds && config.allowedUserIds.length > 0) {
-        // 如果当前用户的ID不在白名单中
-        if (!config.allowedUserIds.includes(userId)) {
-            logWithTimestamp('log', `拒绝了来自非白名单用户的访问：\n  - User ID: ${userId}\n  - Username: @${username}\n  - Chat ID: ${chatId}\n  - Message: "${text}"`);
-            // 向该用户发送一条拒绝消息
-            bot.sendMessage(chatId, '抱歉，您无权使用此机器人。').catch(err => {
+bot.on('message', (msg) => {
+
+    const chatId = msg.chat.id;
+
+    const text = msg.text;
+
+    const userId = msg.from.id;
+
+    // 优先使用用户名，其次显示名，用于 Multiplayer 群组模式的前缀
+
+    const username = msg.from.username || msg.from.first_name || '用户';
+
+    // 判断是否为群组/超级群组（TelegramGroup 环境）
+
+    const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
+
+
+
+    // 检查聊天白名单是否已配置且不为空（群组场景下按 chatId 控制，防止机器人被拉入无关群组）
+
+    if (config.allowedChatIds && config.allowedChatIds.length > 0) {
+
+        if (!config.allowedChatIds.includes(chatId)) {
+
+            logWithTimestamp('log', `拒绝了来自非白名单聊天 ${chatId} 的访问（群组: ${isGroup}）`);
+
+            bot.sendMessage(chatId, '抱歉，此聊天未在允许列表中。').catch(err => {
+
                 logWithTimestamp('error', `向 ${chatId} 发送拒绝消息失败:`, err.message);
+
             });
-            // 终止后续处理
+
             return;
+
         }
+
     }
+
+
+
+    // 检查用户白名单是否已配置且不为空
+
+    if (config.allowedUserIds && config.allowedUserIds.length > 0) {
+
+        // 如果当前用户的ID不在白名单中
+
+        if (!config.allowedUserIds.includes(userId)) {
+
+            logWithTimestamp('log', `拒绝了来自非白名单用户的访问：\n  - User ID: ${userId}\n  - Username: @${username}\n  - Chat ID: ${chatId}\n  - Message: "${text}"`);
+
+            // 向该用户发送一条拒绝消息
+
+            bot.sendMessage(chatId, '抱歉，您无权使用此机器人。').catch(err => {
+
+                logWithTimestamp('error', `向 ${chatId} 发送拒绝消息失败:`, err.message);
+
+            });
+
+            // 终止后续处理
+
+            return;
+
+        }
+
+    }
+
+
 
     if (!text) return;
 
+
+
     if (text.startsWith('/')) {
+
         const parts = text.slice(1).trim().split(/\s+/);
+
         const command = parts[0].toLowerCase();
+
         const args = parts.slice(1);
 
+
+
         // 系统命令由服务器直接处理
+
         if (['reload', 'restart', 'exit', 'ping'].includes(command)) {
+
             handleSystemCommand(command, chatId);
+
             return;
+
         }
 
+
+
         // 其他命令也由服务器处理，但可能需要前端执行
+
         handleTelegramCommand(command, args, chatId);
+
         return;
+
     }
 
+
+
     // 处理普通消息
+
     if (sillyTavernClient && sillyTavernClient.readyState === WebSocket.OPEN) {
-        logWithTimestamp('log', `从Telegram用户 ${chatId} 收到消息: "${text}"`);
-        const payload = JSON.stringify({ type: 'user_message', chatId, text });
+
+        logWithTimestamp('log', `从Telegram用户 ${chatId} 收到消息 (${isGroup ? '群组' : '私聊'} @${username}): "${text}"`);
+
+        const payload = JSON.stringify({
+
+            type: 'user_message',
+
+            chatId,
+
+            text,
+
+            username,
+
+            userId,
+
+            isGroup,
+
+        });
+
         sillyTavernClient.send(payload);
+
     } else {
+
         logWithTimestamp('warn', '收到Telegram消息，但SillyTavern扩展未连接。');
+
         bot.sendMessage(chatId, '抱歉，我现在无法连接到SillyTavern。请确保SillyTavern已打开并启用了Telegram扩展。');
+
     }
+
 });
