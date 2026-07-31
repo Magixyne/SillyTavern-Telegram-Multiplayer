@@ -873,9 +873,7 @@ wss.on('connection', ws => {
 
             // --- 处理流式文本块 ---
             if (data.type === 'stream_chunk' && data.chatId) {
-                logWithTimestamp('log', `收到流式文本块，ChatID: ${data.chatId}, 长度: ${data.text?.length || 0}`);
                 let session = ongoingStreams.get(data.chatId);
-                logWithTimestamp('log', `会话状态: ${session ? '已存在' : '不存在'}, 当前会话数: ${ongoingStreams.size}`);
 
                 // 1. 如果会话不存在，立即同步创建一个占位会话
                 if (!session) {

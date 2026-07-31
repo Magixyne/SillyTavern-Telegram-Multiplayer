@@ -22,7 +22,7 @@ const DEFAULT_SETTINGS = Object.freeze({
     bridgeUrl: '',                   // 留空 = 自动探测内置 Server（酒馆 Server 插件）；填写则手动连接
     autoConnect: true,
     // ---- Multiplayer 设置 ----
-    multiplayerEnabled: false,      // 是否启用群组多人模式
+    multiplayerEnabled: true,       // 是否启用群组多人模式（默认开启，可在设置面板关闭）
     userPrefix: '<用户>: ',          // 用户消息前缀格式: '<用户>: ' | '用户: ' | '[用户]: ' | '*用户* '
     defaultMode: 'instant',          // 默认游戏模式: 'instant'(即时) | 'buffered'(缓冲)
     bufferWindowSeconds: 30,         // 缓冲模式：收集窗口（秒）
