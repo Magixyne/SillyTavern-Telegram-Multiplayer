@@ -919,6 +919,7 @@ wss.on('connection', ws => {
                                 session.sendingInitial = false;
                                 stopTypingInterval(session.typingInterval);
                                 ongoingStreams.delete(data.chatId);
+                                resolveMessagePromise(null); // 避免 messagePromise 永悬
                             });
                     }
                 } else {
@@ -944,6 +945,9 @@ wss.on('connection', ws => {
                             }).catch(err => {
                                 logWithTimestamp('error', '发送初始Telegram消息失败:', err.message);
                                 session.sendingInitial = false;
+                                if (session.resolveMessagePromise) {
+                                    session.resolveMessagePromise(null); // 避免 messagePromise 永悬
+                                }
                             });
                     }
                 }
@@ -1014,6 +1018,17 @@ wss.on('connection', ws => {
                 if (session) {
                     // 停止"输入中"状态 (确保清理)
                     stopTypingInterval(session.typingInterval);
+
+                    // 竞态修复：初始消息可能还在发送中（messageId 尚未赋值）。
+                    // 此时若直接发最终消息，群里会出现"初始消息 + 完整消息"两条重复。
+                    // 等待初始消息完成拿到 messageId 后原地编辑，最多等 3 秒。
+                    if (!session.messageId && session.sendingInitial && session.messagePromise) {
+                        logWithTimestamp('log', `初始消息发送中，等待其完成后再编辑最终消息...`);
+                        await Promise.race([
+                            session.messagePromise.then(() => { }).catch(() => { }),
+                            new Promise(resolve => setTimeout(resolve, 3000)),
+                        ]);
+                    }
 
                     // 直接使用 session.messageId
                     if (session.messageId) {

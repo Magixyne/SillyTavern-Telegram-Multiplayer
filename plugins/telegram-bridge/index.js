@@ -471,6 +471,7 @@ function handleStreamChunk(data) {
                     session.sendingInitial = false;
                     stopTypingInterval(session.typingInterval);
                     ongoingStreams.delete(chatId);
+                    resolveMessagePromise(null); // 避免 messagePromise 永悬
                 });
         }
     } else {
@@ -487,6 +488,7 @@ function handleStreamChunk(data) {
                 .catch((err) => {
                     logWithTimestamp('error', '发送初始消息失败:', err.message);
                     session.sendingInitial = false;
+                    if (session.resolveMessagePromise) session.resolveMessagePromise(null); // 避免 messagePromise 永悬
                 });
         }
     }
@@ -522,6 +524,16 @@ async function handleFinalMessageUpdate(data) {
 
     if (session) {
         stopTypingInterval(session.typingInterval);
+
+        // 竞态修复：初始消息可能还在发送中（messageId 尚未赋值）。
+        // 等待其完成拿到 messageId 后原地编辑，避免群里出现"初始消息 + 完整消息"两条重复。
+        if (!session.messageId && session.sendingInitial && session.messagePromise) {
+            await Promise.race([
+                session.messagePromise.then(() => { }).catch(() => { }),
+                new Promise(resolve => setTimeout(resolve, 3000)),
+            ]);
+        }
+
         if (session.messageId) {
             if (formatted.text.length > 4000) {
                 await bot.deleteMessage(chatId, session.messageId).catch(() => {});

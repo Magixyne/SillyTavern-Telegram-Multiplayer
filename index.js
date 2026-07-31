@@ -89,7 +89,8 @@ function updateStatus(message, color) {
  * @returns {string} 添加前缀后的文本
  */
 function applyUserPrefix(username, text) {
-    if (!username) return text;
+    // 防御：过滤空值及 "null"/"undefined" 字符串，避免出现 "null: xxx" 的异常前缀
+    if (!username || username === 'null' || username === 'undefined') return text;
     const format = getSettings().userPrefix || '<用户>: ';
     const displayName = username.startsWith('@') ? username.slice(1) : username;
     switch (format) {
@@ -317,7 +318,7 @@ async function processMessage(item) {
         if (item.username && getSettings().multiplayerEnabled) {
             messageText = applyUserPrefix(item.username, item.text);
         }
-    } else if (item.username) {
+    } else if (item.username && item.username !== 'null' && item.username !== 'undefined') {
         messageAuthorName = item.username;
     }
     try {
