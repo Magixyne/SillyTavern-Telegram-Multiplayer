@@ -248,6 +248,7 @@ function uniquePresetName(baseName) {
 }
 
 async function importBridgeCharacterUpload(upload, switchAfter = false) {
+    const { selectCharacterById } = SillyTavern.getContext();
     const file = base64ToFile(upload.dataBase64, upload.fileName);
     const ext = String(upload.fileName || '').split('.').pop().toLowerCase();
     if (!['png', 'json'].includes(ext)) throw new Error(`Unsupported character file: ${ext}`);
@@ -282,6 +283,7 @@ async function importBridgeCharacterUpload(upload, switchAfter = false) {
 }
 
 async function importBridgeOpenAIPresetUpload(upload, switchAfter = false) {
+    const { saveSettingsDebounced } = SillyTavern.getContext();
     const text = atob(upload.dataBase64);
     let presetBody;
     try {
@@ -564,6 +566,7 @@ async function refreshCurrentProviderModelList(expectedModel = '') {
 
 
 async function applyProviderProfile(provider, selectedSecret = null) {
+    const { saveSettingsDebounced } = SillyTavern.getContext();
     await switchChatCompletionSourceIfNeeded(provider.source);
 
     if (provider.source === chat_completion_sources.CUSTOM) {
@@ -591,6 +594,7 @@ async function applyProviderProfile(provider, selectedSecret = null) {
 }
 
 async function switchModelByDefinition(definition) {
+    const { saveSettingsDebounced } = SillyTavern.getContext();
     if (!definition?.model) throw new Error('模型定义缺少 model 字段');
     await switchChatCompletionSourceIfNeeded(definition.source);
     const source = oai_settings.chat_completion_source;
@@ -1285,7 +1289,7 @@ async function connect() {
 
                             if (targetChar) {
                                 const charIndex = characters.indexOf(targetChar);
-                                await selectCharacterById(charIndex);
+                                await context.selectCharacterById(charIndex);
                                 commandSuccess = true;
                                 await sendChatSelectionForCharacter(charIndex, `已成功切换到角色 "${targetName}"。
 请选择聊天记录，或新建聊天：`);
@@ -1311,7 +1315,7 @@ async function connect() {
                             }
                             const targetChatFile = `${data.args.join(' ')}`;
                             try {
-                                await openCharacterChat(targetChatFile);
+                                await context.openCharacterChat(targetChatFile);
                                 replyText = `已加载聊天记录： ${targetChatFile}`;
                                 commandSuccess = true;
                             } catch (err) {
@@ -1329,7 +1333,7 @@ async function connect() {
                                 if (index >= 0 && index < characters.length) {
                                     const targetChar = characters[index];
                                     const charIndex = context.characters.indexOf(targetChar);
-                                    await selectCharacterById(charIndex);
+                                    await context.selectCharacterById(charIndex);
                                     commandSuccess = true;
                                     await sendChatSelectionForCharacter(charIndex, `已切换到角色 "${targetChar.name}"。
 请选择聊天记录，或新建聊天：`);
@@ -1353,7 +1357,7 @@ async function connect() {
                                     const targetChat = chatFiles[index];
                                     const chatName = targetChat.file_name.replace('.jsonl', '');
                                     try {
-                                        await openCharacterChat(chatName);
+                                        await context.openCharacterChat(chatName);
                                         replyText = `已加载聊天记录： ${chatName}`;
                                         commandSuccess = true;
                                     } catch (err) {
