@@ -186,6 +186,7 @@ class TelegramBotClient {
         lastActiveChatId = chatId;
         const userId = msg.from.id;
         const username = msg.from.username || msg.from.first_name || '用户';
+        const firstName = msg.from.first_name || ''; // 显示名，供前缀格式 "名字 (@用户名)" 使用
         const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
 
         // 命令
@@ -211,7 +212,7 @@ class TelegramBotClient {
         }
 
         logWithTimestamp('log', `收到消息 ${isGroup ? '群组' : '私聊'} @${username}: "${text.slice(0, 60)}"`);
-        forwardToST({ type: 'user_message', chatId, text, username, userId, isGroup });
+        forwardToST({ type: 'user_message', chatId, text, username, firstName, userId, isGroup });
     }
 
     handleCallbackQuery(cq) {

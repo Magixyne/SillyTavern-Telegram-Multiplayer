@@ -1321,6 +1321,7 @@ bot.on('message', (msg) => {
     // 优先使用用户名，其次显示名，用于 Multiplayer 群组模式的前缀
 
     const username = msg.from.username || msg.from.first_name || '用户';
+    const firstName = msg.from.first_name || ''; // 显示名，供前缀格式 "名字 (@用户名)" 使用
 
     // 判断是否为群组/超级群组（TelegramGroup 环境）
 
@@ -1429,6 +1430,8 @@ bot.on('message', (msg) => {
             text,
 
             username,
+
+            firstName,
 
             userId,
 
