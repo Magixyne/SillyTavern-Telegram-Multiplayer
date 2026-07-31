@@ -53,3 +53,6 @@ Desktop.ini
 config.js
 token.js 
 .alma-snapshots
+
+# 运行时状态
+server/.restart_protection
