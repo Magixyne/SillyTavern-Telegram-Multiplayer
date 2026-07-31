@@ -242,11 +242,19 @@ checkRestartProtection();
 
 // 检查配置文件是否存在
 const configPath = path.join(__dirname, './config.js');
+const exampleConfigPath = path.join(__dirname, './config.example.js');
 let config = {};
+let configSourceName = 'config.js';
 
 // 如果配置文件存在，加载它作为基础配置
 if (fs.existsSync(configPath)) {
     config = require('./config');
+} else if (fs.existsSync(exampleConfigPath)) {
+    // 开发模式：没有 config.js 时自动回退到 config.example.js
+    config = require('./config.example.js');
+    configSourceName = 'config.example.js（开发模式，未找到 config.js）';
+    logWithTimestamp('warn', '未找到 config.js，已自动回退到 config.example.js（开发模式）');
+    logWithTimestamp('warn', '如需持久化配置，请复制 config.example.js 为 config.js 后修改');
 } else if (!process.env.TELEGRAM_BOT_TOKEN) {
     // 如果既没有配置文件也没有环境变量，则报错
     logWithTimestamp('error', '错误: 找不到配置文件 config.js 且未设置 TELEGRAM_BOT_TOKEN 环境变量！');
@@ -255,8 +263,8 @@ if (fs.existsSync(configPath)) {
 }
 
 // 环境变量优先级高于配置文件 (Requirements 2.3, 2.4)
-// 读取 TELEGRAM_BOT_TOKEN 环境变量
-const token = process.env.TELEGRAM_BOT_TOKEN || config.telegramToken;
+// 读取 TELEGRAM_BOT_TOKEN 环境变量（let：开发模式下可能通过控制台输入覆盖）
+let token = process.env.TELEGRAM_BOT_TOKEN || config.telegramToken;
 
 // 读取 WSS_PORT 环境变量
 const wssPort = parseInt(process.env.WSS_PORT) || config.wssPort || 2333;
@@ -296,15 +304,61 @@ if (process.env.MESSAGE_PARSE_MODE) {
 }
 
 // 检查是否修改了默认token
-if (!token || token === 'TOKEN' || token === 'YOUR_TELEGRAM_BOT_TOKEN_HERE') {
-    logWithTimestamp('error', '错误: 请设置有效的 Telegram Bot Token！');
-    logWithTimestamp('error', '可以通过环境变量 TELEGRAM_BOT_TOKEN 或在 config.js 中设置 telegramToken');
-    process.exit(1); // 终止程序
+function isPlaceholderToken(t) {
+    return !t || t === 'TOKEN' || t === 'YOUR_TELEGRAM_BOT_TOKEN_HERE';
+}
+
+/**
+ * 从控制台同步读取一行输入（开发模式手动输入 Token 用）
+ * @param {string} promptText - 提示文字
+ * @returns {string} 用户输入的内容（已去除首尾空白）
+ */
+function readLineSync(promptText) {
+    if (promptText) process.stdout.write(promptText);
+    let line = '';
+    const buf = Buffer.alloc(1);
+    try {
+        while (true) {
+            const bytesRead = fs.readSync(process.stdin.fd, buf, 0, 1, null);
+            if (bytesRead <= 0) break;
+            const ch = buf.toString('utf8');
+            // Windows 控制台回车是 \r\n，两者都视为行结束
+            if (ch === '\n' || ch === '\r') break;
+            line += ch;
+        }
+    } catch (error) {
+        return '';
+    }
+    return line.trim();
+}
+
+// 如果 token 无效（占位符/为空）：
+// - 交互式终端（开发模式）→ 在控制台手动输入 token（仅本次运行有效）
+// - 非交互环境（Docker/后台）→ 保持原来的报错退出行为
+if (isPlaceholderToken(token)) {
+    if (process.stdin.isTTY) {
+        logWithTimestamp('warn', '未检测到有效的 Telegram Bot Token。');
+        logWithTimestamp('warn', '开发模式：请在下方手动输入 Token（输入后按回车）：');
+        const inputToken = readLineSync('> ');
+        if (inputToken) {
+            token = inputToken;
+            logWithTimestamp('log', '已通过控制台输入 Token（仅本次运行有效，不会写入配置文件）。');
+        } else {
+            logWithTimestamp('error', '错误: 未输入有效的 Token，程序退出。');
+            logWithTimestamp('error', '也可以通过环境变量 TELEGRAM_BOT_TOKEN 或在 config.js 中设置 telegramToken');
+            process.exit(1); // 终止程序
+        }
+    } else {
+        logWithTimestamp('error', '错误: 请设置有效的 Telegram Bot Token！');
+        logWithTimestamp('error', '可以通过环境变量 TELEGRAM_BOT_TOKEN 或在 config.js 中设置 telegramToken，');
+        logWithTimestamp('error', '或在交互式终端运行本程序后手动输入 Token');
+        process.exit(1); // 终止程序
+    }
 }
 
 // 初始化Telegram Bot，但不立即启动轮询
 const bot = new TelegramBot(token, { polling: false });
-logWithTimestamp('log', '正在初始化Telegram Bot...');
+logWithTimestamp('log', `正在初始化Telegram Bot...（配置来源: ${configSourceName}）`);
 
 // 手动清除所有未处理的消息，然后启动轮询
 (async function clearAndStartPolling() {
@@ -456,10 +510,12 @@ function reloadServer(chatId) {
         }
     });
     try {
-        delete require.cache[require.resolve('./config.js')];
-        const newConfig = require('./config.js');
+        // 与启动逻辑保持一致：没有 config.js 时回退到 config.example.js
+        const reloadPath = fs.existsSync(configPath) ? './config.js' : './config.example.js';
+        delete require.cache[require.resolve(reloadPath)];
+        const newConfig = require(reloadPath);
         Object.assign(config, newConfig);
-        logWithTimestamp('log', '配置文件已重新加载');
+        logWithTimestamp('log', `配置文件已重新加载 (${reloadPath})`);
     } catch (error) {
         logWithTimestamp('error', '重新加载配置文件时出错:', error);
         if (chatId) bot.sendMessage(chatId, '重新加载配置文件时出错: ' + error.message);

@@ -86,6 +86,22 @@ node server.js
 | `ALLOWED_CHAT_IDS` | 聊天/群组白名单（逗号分隔，Multiplayer 场景限制机器人只在指定群组响应） | 空（允许所有） |
 | `MESSAGE_PARSE_MODE` | 消息格式 (HTML/MarkdownV2/plain) | HTML |
 
+### 开发模式（无需 config.js）
+
+没有 `config.js` 时会自动回退加载 `config.example.js`，并在交互式终端中提示手动输入 Bot Token：
+
+```bash
+cd server
+npm install
+node server.js
+# 未找到 config.js，已自动回退到 config.example.js（开发模式）
+# 开发模式：请在下方手动输入 Token（输入后按回车）：
+> 123456789:AAHxxxxx...
+```
+
+- 控制台输入的 Token 仅本次运行有效，不会写入配置文件
+- 非交互环境（Docker / 后台运行 / CI）下不会等待输入，会按原逻辑报错退出，避免进程卡死
+
 ### 群组白名单（ALLOWED_CHAT_IDS）
 
 获取群组 ID 的方法：
