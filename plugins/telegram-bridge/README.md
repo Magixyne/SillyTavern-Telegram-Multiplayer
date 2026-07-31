@@ -22,7 +22,7 @@
 
 三种方式（优先级从高到低）：
 
-1. **扩展设置面板**（推荐）：酒馆 → Extensions → Telegram Connector → 内置 Server 区块 → 填 Token → 保存 → 启动
+1. **扩展设置面板**（推荐）：酒馆 → Extensions → Telegram MultiPlayer → 内置 Server 区块 → 填 Token → 保存 → 启动
 2. 环境变量：`TELEGRAM_BOT_TOKEN=123456:ABC...`
 3. 本目录 `config.json`：`{ "telegramToken": "123456:ABC..." }`（保存 Token 时自动生成）
 
