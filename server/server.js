@@ -1542,11 +1542,8 @@ wss.on('connection', ws => {
                 // 如果不存在会话但收到stream_end，这是一个异常情况
                 // 可能是由于某些原因会话被提前清理了
                 else {
-                    logWithTimestamp('warn', `收到流式结束信号，但找不到对应的会话 ChatID ${data.chatId}`);
-                    // 为安全起见，我们仍然发送消息，但这种情况不应该发生
-                    await bot.sendMessage(data.chatId, data.text || "消息生成完成").catch(err => {
-                        logWithTimestamp('error', '发送流式结束消息失败:', err.message);
-                    });
+                    logWithTimestamp('warn', `收到流式结束信号，但找不到对应的会话 ChatID ${data.chatId}（可能是异常清理，已忽略）`);
+                    // 不向 Telegram 发送任何提示消息，避免打扰
                 }
                 return;
             }

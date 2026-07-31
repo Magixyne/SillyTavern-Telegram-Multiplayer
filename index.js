@@ -938,16 +938,9 @@ async function handleBridgeControlCommand(data, context) {
  */
 function enqueueOrProcess(item) {
     if (isGenerating) {
+        // 静默入队：不向 Telegram 发送任何提示消息，避免打扰（队列会在当前回复完成后自动处理）
         messageQueue.push(item);
         console.log(`[Telegram Bridge] 正在生成回复，消息已入队。队列长度: ${messageQueue.length}`);
-        // 即时模式下给玩家一个提示（缓冲模式静默收集）
-        if (getSettings().defaultMode === 'instant' && ws && ws.readyState === WebSocket.OPEN) {
-            ws.send(JSON.stringify({
-                type: 'ai_reply',
-                chatId: item.chatId,
-                text: '⏳ AI正在生成回复中，您的消息已加入队列，将在当前回复完成后处理。',
-            }));
-        }
         return;
     }
     processMessage(item);
