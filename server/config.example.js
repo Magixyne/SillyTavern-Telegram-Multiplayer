@@ -16,6 +16,14 @@ module.exports = {
     // 示例: [123456789, 987654321]
     allowedUserIds: [],
 
+    // 允许与机器人交互的Telegram聊天/群组ID白名单（Multiplayer 群组场景）
+    // 将允许的群组ID或私聊ID添加到一个数组中，机器人只会在这些聊天中响应。
+    // 如何获取群组ID：将机器人拉入群组后，向群组发送消息，查看服务器日志中的 Chat ID，
+    // 或使用 @RawDataBot 将机器人添加进群组查看 chat.id。
+    // 如果留空数组 `[]`，则表示允许所有聊天访问。
+    // 示例: [-1001234567890, 987654321]
+    allowedChatIds: [],
+
     // 消息格式化配置
     // 用于控制发送到 Telegram 的消息格式
     messageFormat: {

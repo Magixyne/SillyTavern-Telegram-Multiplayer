@@ -52,3 +52,4 @@ Desktop.ini
 # 在此处添加您的项目特定忽略项
 config.js
 token.js 
+.alma-snapshots
