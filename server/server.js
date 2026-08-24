@@ -1566,7 +1566,8 @@ wss.on('connection', ws => {
                 // 不再发送任何消息：最终文本会通过 final_message_update 发送，
                 // 这里补发只会产生重复/垃圾消息。
                 else {
-                    logWithTimestamp('warn', `收到流式结束信号，但找不到对应的会话 ChatID ${data.chatId}，等待 final_message_update`);
+                    logWithTimestamp('warn', `收到流式结束信号，但找不到对应的会话 ChatID ${data.chatId}（可能是异常清理，已忽略）`);
+                    // 不向 Telegram 发送任何提示消息，避免打扰
                 }
                 return;
             }
