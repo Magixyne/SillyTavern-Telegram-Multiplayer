@@ -1567,7 +1567,8 @@ async function connect() {
                                 break;
                             }
 
-                            replyText = `未知命令: /${data.command}。使用 /help 查看所有命令。`;
+                            // 未知命令：静默忽略，不回复（避免群聊噪音）
+                            replyText = null;
                         }
                     }
                 } catch (error) {
@@ -1577,15 +1578,16 @@ async function connect() {
 
                 // 发送命令执行结果
                 if (ws && ws.readyState === WebSocket.OPEN) {
-                    // 发送命令执行结果到Telegram
-                    ws.send(JSON.stringify({ type: 'ai_reply', chatId: data.chatId, text: replyText }));
-
+                    // 未知命令（replyText 为 null）不回 ai_reply，仅记录执行状态
+                    if (replyText) {
+                        ws.send(JSON.stringify({ type: 'ai_reply', chatId: data.chatId, text: replyText }));
+                    }
                     // 发送命令执行状态反馈到服务器
                     ws.send(JSON.stringify({
                         type: 'command_executed',
                         command: data.command,
                         success: commandSuccess,
-                        message: replyText
+                        message: replyText || ''
                     }));
                 }
 

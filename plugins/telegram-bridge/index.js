@@ -194,6 +194,12 @@ class TelegramBotClient {
         }
         // 注意：不屏蔽其他 bot 的消息 —— 多人群组中其他 AI bot 也是角色，需要转发进 SillyTavern
 
+        // 消息中提到本 bot 用户名 → 立即停止 WS 心跳包发送
+        if (text && this.username && text.toLowerCase().includes(this.username)) {
+            logWithTimestamp('log', `消息中提到本 bot（@${this.username}），立即停止心跳包`);
+            stopHeartbeat();
+        }
+
         lastActiveChatId = chatId;
         const userId = msg.from.id;
         const username = msg.from.username || msg.from.first_name || '用户';

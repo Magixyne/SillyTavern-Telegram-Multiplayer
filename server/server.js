@@ -690,14 +690,60 @@ const bot = telegramDisabled ? {
 logWithTimestamp('log', telegramDisabled ? 'Telegram Bot 已禁用（测试模式）' : `正在初始化Telegram Bot...（配置来源: ${configSourceName}）`);
 
 // 本 bot 的 username（小写）。用于命令 @botusername 路由与自身回环消息识别。
-let myBotUsername = null;
+// getMe() 依赖 Telegram 网络，可能超时失败（api.telegram.org 连接不稳定）。
+// 若失败导致 username 未知，bot 将无法识别自己的消息（回环保护失效，且把
+// 自己当"其他 bot"）。因此：成功后写入本地缓存；失败时先用缓存兜底再重试。
+const BOT_USERNAME_CACHE_FILE = path.join(__dirname, '.bot_username');
+
+function loadCachedBotUsername() {
+    try {
+        const cached = fs.readFileSync(BOT_USERNAME_CACHE_FILE, 'utf8').trim().toLowerCase();
+        return cached || null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function saveCachedBotUsername(username) {
+    try {
+        fs.writeFileSync(BOT_USERNAME_CACHE_FILE, String(username).toLowerCase());
+    } catch (e) {
+        logWithTimestamp('warn', '写入 Bot 用户名缓存失败:', e.message);
+    }
+}
+
+// 兜底优先级: config.botUsername > 本地缓存 > getMe() 成功值（getMe 成功会覆盖并刷新缓存）
+let myBotUsername = config.botUsername ? String(config.botUsername).toLowerCase().replace(/^@/, '') : null;
+if (myBotUsername) logWithTimestamp('log', `使用 config 定义的 Bot 用户名: @${myBotUsername}（getMe 成功后将被覆盖）`);
 if (!telegramDisabled) {
-    bot.getMe()
-        .then(me => {
-            myBotUsername = (me && me.username ? me.username.toLowerCase() : null);
-            logWithTimestamp('log', `Telegram Bot 已连接: @${me.username}`);
-        })
-        .catch(err => logWithTimestamp('warn', '获取 Bot 信息失败（命令 @ 路由与回环过滤将降级）:', err.message));
+    const tryGetMe = (attempt = 0) => {
+        bot.getMe()
+            .then(me => {
+                myBotUsername = (me && me.username ? me.username.toLowerCase() : null);
+                if (myBotUsername) saveCachedBotUsername(myBotUsername);
+                logWithTimestamp('log', `Telegram Bot 已连接: @${me.username}`);
+            })
+            .catch(err => {
+                // getMe 失败：用缓存用户名兜底，保持回环过滤与 @ 路由生效
+                if (!myBotUsername) {
+                    myBotUsername = loadCachedBotUsername();
+                    if (myBotUsername) {
+                        logWithTimestamp('warn', `获取 Bot 信息失败，已用缓存用户名 @${myBotUsername}（回环过滤与 @ 路由保持生效）: ${err.message}`);
+                        return; // 有缓存即可工作；后续 getMe 成功会刷新缓存
+                    }
+                }
+                if (myBotUsername) {
+                    // config 已定义（或已有兜底值），识别不降级，无需重试告警
+                    logWithTimestamp('warn', `获取 Bot 信息失败，使用当前可用用户名 @${myBotUsername}（config/缓存兜底）: ${err.message}`);
+                    return;
+                }
+                logWithTimestamp('warn', `获取 Bot 信息失败（无可用用户名，回环过滤暂时降级）: ${err.message}`);
+                if (attempt < 5) {
+                    setTimeout(() => tryGetMe(attempt + 1), 30000); // 30s 后重试，最多 5 次
+                }
+            });
+    };
+    tryGetMe();
 }
 
 // 手动清除所有未处理的消息，然后启动轮询
@@ -1147,8 +1193,8 @@ function handleSystemCommand(command, chatId) {
             }
             break;
         default:
-            logWithTimestamp('warn', `未知的系统命令: ${command}`);
-            bot.sendMessage(chatId, `未知的系统命令: /${command}`);
+            // 未知命令静默忽略，不回复（避免群聊噪音）
+            logWithTimestamp('log', `未知系统命令 /${command} 已忽略（静默）`);
             return;
     }
 
@@ -1167,8 +1213,8 @@ async function handleTelegramCommand(command, args, chatId, userId = chatId) {
     bot.sendChatAction(chatId, 'typing').catch(error =>
         logWithTimestamp('error', '发送"输入中"状态失败:', error));
 
-    // 默认回复
-    let replyText = `未知命令: /${command}。 使用 /help 查看所有命令。`;
+    // 默认回复（未知命令不回复，静默忽略）
+    let replyText = '';
 
     // 特殊处理help命令，显示带按钮的菜单
     if (command === 'help') {
@@ -1408,6 +1454,11 @@ async function handleTelegramCommand(command, args, chatId, userId = chatId) {
             }
     }
 
+    // 未知命令：replyText 为空，静默忽略不回复（避免群聊噪音）
+    if (!replyText) {
+        logWithTimestamp('log', `未知命令 /${command} 已忽略（静默）`);
+        return;
+    }
     // 发送回复（支持超长消息分割）
     sendLongMessage(bot, chatId, replyText);
 }
@@ -2005,7 +2056,8 @@ bot.on('callback_query', async (callbackQuery) => {
                 handleTelegramCommand(command, [], chatId, userId);
                 break;
             default:
-                bot.sendMessage(chatId, '未知操作');
+                // 未知按钮回调静默忽略（可能是旧版残留按钮）
+                logWithTimestamp('log', `未知按钮回调 ${data} 已忽略（静默）`);
         }
     }
 });
@@ -2039,6 +2091,12 @@ bot.on('message', async (msg) => {
     if (senderIsBot && myBotUsername && senderUsername === myBotUsername) {
         logWithTimestamp('warn', `忽略本 bot 自身的回环消息 @${msg.from.username}（可能来自另一实例轮询同一 token）`);
         return;
+    }
+
+    // 消息中提到本 bot 用户名 → 立即停止 WS 心跳包发送
+    if (text && myBotUsername && text.toLowerCase().includes(myBotUsername)) {
+        logWithTimestamp('log', `消息中提到本 bot（@${myBotUsername}），立即停止心跳包`);
+        stopHeartbeat();
     }
 
 

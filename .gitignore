@@ -56,6 +56,7 @@ token.js
 
 # 运行时状态
 server/.restart_protection
+server/.bot_username
 
 # 内置 Server 插件运行时配置（含 Token，勿提交）
 plugins/telegram-bridge/config.json
