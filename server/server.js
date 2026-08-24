@@ -689,6 +689,17 @@ const bot = telegramDisabled ? {
 
 logWithTimestamp('log', telegramDisabled ? 'Telegram Bot 已禁用（测试模式）' : `正在初始化Telegram Bot...（配置来源: ${configSourceName}）`);
 
+// 本 bot 的 username（小写）。用于命令 @botusername 路由与自身回环消息识别。
+let myBotUsername = null;
+if (!telegramDisabled) {
+    bot.getMe()
+        .then(me => {
+            myBotUsername = (me && me.username ? me.username.toLowerCase() : null);
+            logWithTimestamp('log', `Telegram Bot 已连接: @${me.username}`);
+        })
+        .catch(err => logWithTimestamp('warn', '获取 Bot 信息失败（命令 @ 路由与回环过滤将降级）:', err.message));
+}
+
 // 手动清除所有未处理的消息，然后启动轮询
 if (!telegramDisabled) {
 (async function clearAndStartPolling() {
@@ -2019,6 +2030,17 @@ bot.on('message', async (msg) => {
 
     const isGroup = msg.chat.type === 'group' || msg.chat.type === 'supergroup';
 
+    // --- 机器人消息过滤（防止多 bot 群组刷屏循环 & 双实例回环） ---
+    const senderIsBot = !!(msg.from && msg.from.is_bot);
+    const senderUsername = (msg.from && msg.from.username ? msg.from.username.toLowerCase() : '');
+
+    // 自身回环：收到本 bot 自己发出的消息（另一实例/转发拾取），必须忽略，否则无限循环烧 token。
+    // 注意：不屏蔽其他 bot 的消息 —— 多人群组中其他 AI bot 也是角色，需要转发进 SillyTavern。
+    if (senderIsBot && myBotUsername && senderUsername === myBotUsername) {
+        logWithTimestamp('warn', `忽略本 bot 自身的回环消息 @${msg.from.username}（可能来自另一实例轮询同一 token）`);
+        return;
+    }
+
 
 
     // 检查聊天白名单是否已配置且不为空（群组场景下按 chatId 控制，防止机器人被拉入无关群组）
@@ -2078,11 +2100,22 @@ bot.on('message', async (msg) => {
 
         const parts = text.slice(1).trim().split(/\s+/);
 
-        const command = parts[0].toLowerCase();
+        let command = parts[0].toLowerCase();
 
         const args = parts.slice(1);
 
-
+        // 命令 @botusername 路由：多 bot 群组中 /cmd@otherbot 是发给别的 bot 的，直接忽略；
+        // /cmd@本bot 去掉后缀正常执行；无后缀保持原行为。
+        const atIndex = command.indexOf('@');
+        if (atIndex !== -1) {
+            const addressedBot = command.slice(atIndex + 1);
+            command = command.slice(0, atIndex);
+            if (!command) return; // 纯 @mention，忽略
+            if (myBotUsername && addressedBot.toLowerCase() !== myBotUsername) {
+                logWithTimestamp('log', `忽略命令 /${command}@${addressedBot}：是发给其他 bot 的`);
+                return;
+            }
+        }
 
         // 系统命令由服务器直接处理
 

@@ -122,6 +122,7 @@ class TelegramBotClient {
         // 先确认 token 有效（getMe）
         const me = await tgRequest.call({ token: this.token }, 'getMe', {});
         logWithTimestamp('log', `Telegram Bot 已连接: @${me.username}`);
+        this.username = (me.username || '').toLowerCase(); // 用于命令 @ 路由与自身回环识别
         this.polling = true;
         this.offset = 0;
         this.pollLoop();
@@ -184,6 +185,15 @@ class TelegramBotClient {
         const text = msg.text;
         if (!text) return; // 忽略非文本消息（图片/贴纸等）
 
+        // 机器人消息过滤：防止多 bot 群组刷屏循环 & 双实例回环（与独立 server 一致）
+        const senderIsBot = !!(msg.from && msg.from.is_bot);
+        const senderUsername = (msg.from && msg.from.username ? msg.from.username.toLowerCase() : '');
+        if (senderIsBot && this.username && senderUsername === this.username) {
+            logWithTimestamp('warn', `忽略本 bot 自身的回环消息 @${msg.from.username}（可能来自另一实例轮询同一 token）`);
+            return;
+        }
+        // 注意：不屏蔽其他 bot 的消息 —— 多人群组中其他 AI bot 也是角色，需要转发进 SillyTavern
+
         lastActiveChatId = chatId;
         const userId = msg.from.id;
         const username = msg.from.username || msg.from.first_name || '用户';
@@ -193,8 +203,20 @@ class TelegramBotClient {
         // 命令
         if (text.startsWith('/')) {
             const parts = text.slice(1).trim().split(/\s+/);
-            const command = parts[0].toLowerCase();
+            let command = parts[0].toLowerCase();
             const args = parts.slice(1);
+
+            // 命令 @botusername 路由：/cmd@otherbot 忽略；/cmd@本bot 去后缀执行
+            const atIndex = command.indexOf('@');
+            if (atIndex !== -1) {
+                const addressedBot = command.slice(atIndex + 1);
+                command = command.slice(0, atIndex);
+                if (!command) return; // 纯 @mention，忽略
+                if (this.username && addressedBot.toLowerCase() !== this.username) {
+                    logWithTimestamp('log', `忽略命令 /${command}@${addressedBot}：是发给其他 bot 的`);
+                    return;
+                }
+            }
 
             if (['reload', 'restart', 'exit', 'ping'].includes(command)) {
                 this.handleSystemCommand(command, chatId);
