@@ -28,7 +28,7 @@ module.exports = {
     // 用于命令 @botusername 路由与自身回环消息识别。
     // 留空 '' 则通过 getMe() 自动获取；Telegram 网络异常导致 getMe() 失败且
     // 本地无缓存时，此项保证识别不降级（回环过滤与 @ 路由保持生效）。
-    // 例: 'linversehelperbot'（不含 @，大小写不敏感）
+    // 例: 'your_bot_username'（不含 @，大小写不敏感）
     botUsername: '',
 
     // 消息格式化配置
