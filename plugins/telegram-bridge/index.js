@@ -194,10 +194,10 @@ class TelegramBotClient {
         }
         // 注意：不屏蔽其他 bot 的消息 —— 多人群组中其他 AI bot 也是角色，需要转发进 SillyTavern
 
-        // 消息中提到本 bot 用户名 → 立即停止 WS 心跳包发送
-        if (text && this.username && text.toLowerCase().includes(this.username)) {
-            logWithTimestamp('log', `消息中提到本 bot（@${this.username}），立即停止心跳包`);
-            stopHeartbeat();
+        // 消息中提到本 bot 用户名 → 标记为提及：前端立即触发回复，流式初始消息立即发出
+        const mentioned = !!(text && this.username && text.toLowerCase().includes(this.username));
+        if (mentioned) {
+            logWithTimestamp('log', `消息中提到本 bot（@${this.username}），立即触发回复`);
         }
 
         lastActiveChatId = chatId;
@@ -241,7 +241,7 @@ class TelegramBotClient {
         }
 
         logWithTimestamp('log', `收到消息 ${isGroup ? '群组' : '私聊'} @${username}: "${text.slice(0, 60)}"`);
-        forwardToST({ type: 'user_message', chatId, text, username, firstName, userId, isGroup });
+        forwardToST({ type: 'user_message', chatId, text, username, firstName, userId, isGroup, mentioned });
     }
 
     handleCallbackQuery(cq) {
@@ -497,7 +497,8 @@ function handleStreamChunk(data) {
         };
         ongoingStreams.set(chatId, session);
 
-        if (session.charCount >= MIN_CHARS_BEFORE_DISPLAY) {
+        // 提及消息（data.mentioned）跳过字符阈值，立即发送初始消息
+        if (session.charCount >= MIN_CHARS_BEFORE_DISPLAY || data.mentioned) {
             session.sendingInitial = true;
             const displayText = data.text.length > 4000 ? data.text.substring(0, 4000) + '...' : data.text + ' ...';
             bot.sendMessage(chatId, displayText)
@@ -516,7 +517,7 @@ function handleStreamChunk(data) {
     } else {
         session.lastText = data.text;
         session.charCount = data.text ? data.text.length : 0;
-        if (!session.messageId && session.charCount >= MIN_CHARS_BEFORE_DISPLAY && !session.sendingInitial) {
+        if (!session.messageId && (session.charCount >= MIN_CHARS_BEFORE_DISPLAY || data.mentioned) && !session.sendingInitial) {
             session.sendingInitial = true;
             const displayText = data.text.length > 4000 ? data.text.substring(0, 4000) + '...' : data.text + ' ...';
             bot.sendMessage(chatId, displayText)

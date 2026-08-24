@@ -1110,6 +1110,7 @@ async function processMessage(item) {
     }
 
     // 3. 设置流式传输的回调
+    let firstChunkSent = false;
     const streamCallback = (...args) => {
         let cumulativeText = '';
         if (typeof args[0] === 'string') {
@@ -1120,22 +1121,27 @@ async function processMessage(item) {
             cumulativeText = args[0].message;
         }
         if (ws && ws.readyState === WebSocket.OPEN && cumulativeText) {
-            ws.send(JSON.stringify({
+            const payload = {
                 type: 'stream_chunk',
                 chatId: item.chatId,
                 text: cumulativeText,
-            }));
+            };
+            // 提及消息：仅首条 chunk 携带 mentioned，服务器跳过字符阈值立即发送初始消息
+            if (!firstChunkSent && item.mentioned) payload.mentioned = true;
+            firstChunkSent = true;
+            ws.send(JSON.stringify(payload));
         }
     };
     eventSource.on(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
 
     // 4. 清理函数：生成结束（成功/失败/手动停止）后执行
-    //    无论成功失败都发送 stream_end：让服务器停止 typing 并启动会话兜底清理，
-    //    避免出错时 typing 无限发送、流式会话残留（残留会导致下一轮复用旧消息）。
+    //    仅在确实发送过流式块时才发送 stream_end（让服务器停止 typing、启动兜底清理）。
+    //    非流式生成（从未有过 chunk，服务器无会话）不发送，避免服务器"找不到会话"的误告警；
+    //    该情形下最终消息由 final_message_update 正常送达，无需 stream_end。
     //    出错时的错误提示由 error_message 单独发送，与 stream_end 无冲突。
     const cleanup = () => {
         eventSource.removeListener(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
-        if (ws && ws.readyState === WebSocket.OPEN) {
+        if (ws && ws.readyState === WebSocket.OPEN && firstChunkSent) {
             ws.send(JSON.stringify({ type: 'stream_end', chatId: item.chatId }));
         }
     };
@@ -1271,9 +1277,28 @@ async function connect() {
                     username: data.username || null,
                     firstName: data.firstName || null,
                     isGroup: data.isGroup === true,
+                    mentioned: data.mentioned === true,
                 };
 
                 const settings = getSettings();
+
+                // 提及本 bot：立即触发回复，跳过合并/缓冲窗口，不让对方干等
+                if (item.mentioned) {
+                    console.log('[Telegram Bridge] 消息提及本 bot，立即触发回复');
+                    // 已有同聊天的合并/缓冲内容：并入并立即冲刷，合并成一次回复
+                    if (mergeBuffer && mergeBuffer.chatId === item.chatId) {
+                        mergeBuffer.parts.push(item);
+                        flushMergeBuffer();
+                        return;
+                    }
+                    if (buffer && buffer.chatId === item.chatId) {
+                        buffer.parts.push(item.isGroup ? applyUserPrefix(item) : item.text);
+                        flushBuffer();
+                        return;
+                    }
+                    enqueueOrProcess(item);
+                    return;
+                }
 
                 // 缓冲模式：群组多人消息先进缓冲区（大窗口合并）
                 if (settings.multiplayerEnabled && settings.defaultMode === 'buffered' && item.isGroup) {

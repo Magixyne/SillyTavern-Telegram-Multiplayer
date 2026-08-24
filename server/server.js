@@ -1523,7 +1523,8 @@ wss.on('connection', ws => {
                     ongoingStreams.set(data.chatId, session);
 
                     // 只有当字符数超过阈值时才发送初始消息 (Requirement 3.2)
-                    if (session.charCount >= MIN_CHARS_BEFORE_DISPLAY) {
+                    // 提及消息（data.mentioned）跳过阈值立即发送，不让对方干等
+                    if (session.charCount >= MIN_CHARS_BEFORE_DISPLAY || data.mentioned) {
                         session.sendingInitial = true;
                         logWithTimestamp('log', `字符数 ${session.charCount} 超过阈值，发送初始消息...`);
                         // 截断过长的文本，避免超过 Telegram 限制
@@ -1546,8 +1547,8 @@ wss.on('connection', ws => {
                     session.lastText = data.text;
                     session.charCount = data.text ? data.text.length : 0;
 
-                    // 检查是否达到字符阈值且尚未发送初始消息
-                    if (!session.messageId && session.charCount >= MIN_CHARS_BEFORE_DISPLAY && !session.sendingInitial) {
+                    // 检查是否达到字符阈值且尚未发送初始消息（提及消息跳过阈值）
+                    if (!session.messageId && (session.charCount >= MIN_CHARS_BEFORE_DISPLAY || data.mentioned) && !session.sendingInitial) {
                         // 标记正在发送初始消息，避免重复发送
                         session.sendingInitial = true;
                         logWithTimestamp('log', `会话已存在，字符数 ${session.charCount} 超过阈值，发送初始消息...`);
@@ -2093,10 +2094,12 @@ bot.on('message', async (msg) => {
         return;
     }
 
-    // 消息中提到本 bot 用户名 → 立即停止 WS 心跳包发送
-    if (text && myBotUsername && text.toLowerCase().includes(myBotUsername)) {
-        logWithTimestamp('log', `消息中提到本 bot（@${myBotUsername}），立即停止心跳包`);
-        stopHeartbeat();
+    // 消息中提到本 bot 用户名 → 标记为提及（随 user_message payload 传给前端）。
+    // 前端收到后立即触发回复（跳过合并/缓冲窗口），并在首条 stream_chunk 上
+    // 回传 mentioned，让服务器跳过字符阈值立即发送流式初始消息。无时间限制、无全局状态。
+    const mentioned = !!(text && myBotUsername && text.toLowerCase().includes(myBotUsername));
+    if (mentioned) {
+        logWithTimestamp('log', `消息中提到本 bot（@${myBotUsername}），立即触发回复`);
     }
 
 
@@ -2218,6 +2221,8 @@ bot.on('message', async (msg) => {
             userId,
 
             isGroup,
+
+            mentioned,
 
         });
 
