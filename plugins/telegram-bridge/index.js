@@ -31,6 +31,7 @@ const TELEGRAM_MAX_LENGTH = 4096;
 const HEARTBEAT_INTERVAL = 30000;
 const TYPING_INTERVAL = 4000;
 const MIN_CHARS_BEFORE_DISPLAY = 50;
+const STREAM_SESSION_TTL_MS = 60000; // 流式会话兜底清理TTL：stream_end 后若最终更新未到达，超时删除残留会话
 const CONFIG_FILE = path.join(__dirname, 'config.json');
 
 // --- 运行时状态 ---
@@ -443,6 +444,15 @@ function handleStreamChunk(data) {
     const chatId = data.chatId;
     let session = ongoingStreams.get(chatId);
 
+    // 残留会话检测：上一轮流式已结束（stream_end 已停 typing）但
+    // final_message_update 未到达时会话残留并携带旧 messageId，
+    // 复用会导致新一轮回复去编辑旧消息。检测到即重建会话。
+    if (session && session.typingInterval === null) {
+        logWithTimestamp('warn', `检测到残留流式会话 ChatID ${chatId}，重建会话（避免覆盖旧消息）`);
+        ongoingStreams.delete(chatId);
+        session = null;
+    }
+
     if (!session) {
         let resolveMessagePromise;
         const messagePromise = new Promise((resolve) => { resolveMessagePromise = resolve; });
@@ -509,10 +519,12 @@ function handleStreamChunk(data) {
                         }
                     })
                     .finally(() => {
-                        if (ongoingStreams.has(chatId)) ongoingStreams.get(chatId).isEditing = false;
+                        const latest = ongoingStreams.get(chatId);
+                        if (latest) latest.isEditing = false;
                     });
             }
-            current.timer = null;
+            // 会话可能在编辑期间被 final_message_update/cleanup_session 删除
+            if (current) current.timer = null;
         }, 2000);
     }
 }
@@ -551,6 +563,8 @@ async function handleFinalMessageUpdate(data) {
         } else {
             await sendLongMessage(chatId, formatted.text, formatted.parseMode);
         }
+        // 清理流式会话（取消兜底清理定时器）
+        clearTimeout(session.cleanupTimer);
         ongoingStreams.delete(chatId);
     } else {
         await sendLongMessage(chatId, formatted.text, formatted.parseMode);
@@ -586,6 +600,15 @@ function handleSTMessage(message) {
             if (session.timer) clearTimeout(session.timer);
             stopTypingInterval(session.typingInterval);
             session.typingInterval = null;
+            // 兜底清理：final_message_update 未在 TTL 内到达时删除残留会话，
+            // 避免无限残留（内存泄漏 + 复用旧消息）
+            clearTimeout(session.cleanupTimer);
+            session.cleanupTimer = setTimeout(() => {
+                if (ongoingStreams.get(data.chatId) === session) {
+                    logWithTimestamp('log', `流式会话 ChatID ${data.chatId} 超时未收到最终更新，已清理残留`);
+                    ongoingStreams.delete(data.chatId);
+                }
+            }, STREAM_SESSION_TTL_MS);
         }
         return;
     }
@@ -623,6 +646,7 @@ function handleSTMessage(message) {
         const session = ongoingStreams.get(data.chatId);
         if (session) {
             if (session.timer) clearTimeout(session.timer);
+            clearTimeout(session.cleanupTimer);
             stopTypingInterval(session.typingInterval);
             ongoingStreams.delete(data.chatId);
         }

@@ -813,8 +813,9 @@ function enqueueOrProcess(item) {
     if (isGenerating) {
         messageQueue.push(item);
         console.log(`[Telegram Bridge] 正在生成回复，消息已入队。队列长度: ${messageQueue.length}`);
-        // 即时模式下给玩家一个提示（缓冲模式静默收集）
-        if (getSettings().defaultMode === 'instant' && ws && ws.readyState === WebSocket.OPEN) {
+        // 即时模式下给玩家一个提示（缓冲模式静默收集）。
+        // 群聊不发送：多人场景下每条排队消息都通知全员会刷屏，静默排队即可。
+        if (getSettings().defaultMode === 'instant' && !item.isGroup && ws && ws.readyState === WebSocket.OPEN) {
             ws.send(JSON.stringify({
                 type: 'ai_reply',
                 chatId: item.chatId,
@@ -972,12 +973,13 @@ async function processMessage(item) {
     eventSource.on(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
 
     // 4. 清理函数：生成结束（成功/失败/手动停止）后执行
+    //    无论成功失败都发送 stream_end：让服务器停止 typing 并启动会话兜底清理，
+    //    避免出错时 typing 无限发送、流式会话残留（残留会导致下一轮复用旧消息）。
+    //    出错时的错误提示由 error_message 单独发送，与 stream_end 无冲突。
     const cleanup = () => {
         eventSource.removeListener(event_types.STREAM_TOKEN_RECEIVED, streamCallback);
         if (ws && ws.readyState === WebSocket.OPEN) {
-            if (!item.error) {
-                ws.send(JSON.stringify({ type: 'stream_end', chatId: item.chatId }));
-            }
+            ws.send(JSON.stringify({ type: 'stream_end', chatId: item.chatId }));
         }
     };
 

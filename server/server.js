@@ -879,6 +879,7 @@ function isBridgeControlCommand(command) {
 // 流式输出配置
 const TYPING_INTERVAL = 4000; // 每4秒发送一次typing状态
 const MIN_CHARS_BEFORE_DISPLAY = config.streaming?.minCharsBeforeDisplay || 50; // 最小显示字符数
+const STREAM_SESSION_TTL_MS = 60000; // 流式会话兜底清理TTL：stream_end 后若最终更新未到达，超时删除残留会话
 
 // --- 心跳管理函数 ---
 /**
@@ -965,7 +966,7 @@ function reloadServer(chatId) {
         return;
     }
     logWithTimestamp('log', '服务器端组件已重载');
-    if (chatId) bot.sendMessage(chatId, '服务器端组件已成功重载。');
+    // 不发送成功通知：/reload 已向请求者发送过"正在重载..."，避免重复确认消息
 }
 
 // 重启服务器函数
@@ -1423,6 +1424,16 @@ wss.on('connection', ws => {
             if (data.type === 'stream_chunk' && data.chatId) {
                 let session = ongoingStreams.get(data.chatId);
 
+                // 残留会话检测：上一轮流式已结束（stream_end 已停止 typing）但
+                // final_message_update 未到达时会话残留，并携带旧 messageId。
+                // 若此时复用，新一轮回复会去编辑上一条旧消息（覆盖旧内容）。
+                // 检测到残留即重建会话，确保新一轮回复发送新消息。
+                if (session && session.typingInterval === null) {
+                    logWithTimestamp('warn', `检测到残留流式会话 ChatID ${data.chatId}，重建会话（避免覆盖旧消息）`);
+                    ongoingStreams.delete(data.chatId);
+                    session = null;
+                }
+
                 // 1. 如果会话不存在，立即同步创建一个占位会话
                 if (!session) {
                     logWithTimestamp('log', `创建新会话，ChatID: ${data.chatId}`);
@@ -1516,10 +1527,12 @@ wss.on('connection', ws => {
                                 if (!err.message.includes('message is not modified'))
                                     logWithTimestamp('error', '编辑Telegram消息失败:', err.message);
                             }).finally(() => {
-                                if (ongoingStreams.has(data.chatId)) ongoingStreams.get(data.chatId).isEditing = false;
+                                const latest = ongoingStreams.get(data.chatId);
+                                if (latest) latest.isEditing = false;
                             });
                         }
-                        currentSession.timer = null;
+                        // 会话可能在编辑期间被 final_message_update/cleanup_session 删除
+                        if (currentSession) currentSession.timer = null;
                     }, 2000);
                 }
                 return;
@@ -1536,17 +1549,24 @@ wss.on('connection', ws => {
                     // 停止"输入中"状态 (Requirement 3.1)
                     stopTypingInterval(session.typingInterval);
                     session.typingInterval = null;
+                    // 兜底清理：若 final_message_update 未在 TTL 内到达（生成中断/前端异常），
+                    // 定时删除残留会话，避免无限残留（内存泄漏 + 复用旧消息）
+                    clearTimeout(session.cleanupTimer);
+                    session.cleanupTimer = setTimeout(() => {
+                        if (ongoingStreams.get(data.chatId) === session) {
+                            logWithTimestamp('log', `流式会话 ChatID ${data.chatId} 超时未收到最终更新，已清理残留`);
+                            ongoingStreams.delete(data.chatId);
+                        }
+                    }, STREAM_SESSION_TTL_MS);
                     logWithTimestamp('log', `收到流式结束信号，等待最终渲染文本更新...`);
                     // 注意：我们不在这里清理会话，而是等待final_message_update
                 }
                 // 如果不存在会话但收到stream_end，这是一个异常情况
-                // 可能是由于某些原因会话被提前清理了
+                // 可能是由于某些原因会话被提前清理了。
+                // 不再发送任何消息：最终文本会通过 final_message_update 发送，
+                // 这里补发只会产生重复/垃圾消息。
                 else {
-                    logWithTimestamp('warn', `收到流式结束信号，但找不到对应的会话 ChatID ${data.chatId}`);
-                    // 为安全起见，我们仍然发送消息，但这种情况不应该发生
-                    await bot.sendMessage(data.chatId, data.text || "消息生成完成").catch(err => {
-                        logWithTimestamp('error', '发送流式结束消息失败:', err.message);
-                    });
+                    logWithTimestamp('warn', `收到流式结束信号，但找不到对应的会话 ChatID ${data.chatId}，等待 final_message_update`);
                 }
                 return;
             }
@@ -1632,7 +1652,8 @@ wss.on('connection', ws => {
                         // 使用支持超长消息的发送函数
                         await sendLongMessage(bot, data.chatId, formatted.text, sendOptions);
                     }
-                    // 清理流式会话
+                    // 清理流式会话（取消兜底清理定时器，避免定时器残留）
+                    clearTimeout(session.cleanupTimer);
                     ongoingStreams.delete(data.chatId);
                     logWithTimestamp('log', `ChatID ${data.chatId} 的流式会话已完成并清理。`);
                 }
@@ -1724,6 +1745,7 @@ wss.on('connection', ws => {
                     if (session.timer) {
                         clearTimeout(session.timer);
                     }
+                    clearTimeout(session.cleanupTimer);
                     // 停止"输入中"状态
                     stopTypingInterval(session.typingInterval);
                     // 删除会话
@@ -1775,19 +1797,9 @@ wss.on('connection', ws => {
     });
 });
 
-// 检查是否需要发送重启完成通知
-if (process.env.RESTART_NOTIFY_CHATID) {
-    const chatId = parseInt(process.env.RESTART_NOTIFY_CHATID);
-    if (!isNaN(chatId)) {
-        setTimeout(() => {
-            bot.sendMessage(chatId, '服务器端组件已成功重启并准备就绪')
-                .catch(err => logWithTimestamp('error', '发送重启通知失败:', err))
-                .finally(() => {
-                    delete process.env.RESTART_NOTIFY_CHATID;
-                });
-        }, 2000);
-    }
-}
+// 注意：/restart 的重启完成通知已移除（请求者已收到"正在重启服务器端组件..."）。
+// process.env.RESTART_NOTIFY_CHATID 仍由 restartServer 传给子进程，
+// 供 checkRestartProtection 在检测到循环重启时发送紧急告警。
 
 // 监听内联键盘按钮回调
 bot.on('callback_query', async (callbackQuery) => {
@@ -1944,7 +1956,7 @@ bot.on('callback_query', async (callbackQuery) => {
                 return;
             }
             sillyTavernClient.send(JSON.stringify(payload));
-            bot.sendMessage(chatId, '正在导入，请稍候...');
+            // 不发送"正在导入"提示：导入完成后前端会发送"已导入角色卡/预设：..."结果消息
             pendingUploads.delete(uploadId);
             clearUploadSession(chatId, pending.userId, false);
             cleanupUploadFile(pending.localPath);
@@ -2016,11 +2028,7 @@ bot.on('message', async (msg) => {
 
             logWithTimestamp('log', `拒绝了来自非白名单聊天 ${chatId} 的访问（群组: ${isGroup}）`);
 
-            bot.sendMessage(chatId, '抱歉，此聊天未在允许列表中。').catch(err => {
-
-                logWithTimestamp('error', `向 ${chatId} 发送拒绝消息失败:`, err.message);
-
-            });
+            // 静默拒绝：不向非白名单聊天回复，避免在无关群组中刷屏，也避免暴露 bot 的存在
 
             return;
 
@@ -2040,13 +2048,7 @@ bot.on('message', async (msg) => {
 
             logWithTimestamp('log', `拒绝了来自非白名单用户的访问：\n  - User ID: ${userId}\n  - Username: @${username}\n  - Chat ID: ${chatId}\n  - Message: "${text}"`);
 
-            // 向该用户发送一条拒绝消息
-
-            bot.sendMessage(chatId, '抱歉，您无权使用此机器人。').catch(err => {
-
-                logWithTimestamp('error', `向 ${chatId} 发送拒绝消息失败:`, err.message);
-
-            });
+            // 静默拒绝：不向非白名单用户回复，避免在群聊中公开点名造成刷屏
 
             // 终止后续处理
 
