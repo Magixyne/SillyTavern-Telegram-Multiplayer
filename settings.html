@@ -6,17 +6,17 @@
         </div>
         <div class="inline-drawer-content">
 
-            <!-- 内置 Server（酒馆 Server 插件） -->
+            <!-- Server 管理（启动器模式） -->
             <div class="telegram-connector_block">
-                <b>🚀 内置 Server（酒馆插件模式）</b>
+                <b>🚀 Server</b>
                 <small style="display:block; margin-top:4px; opacity:0.7;">
-                    将仓库 <code>plugins/telegram-bridge</code> 目录放入酒馆 <code>plugins/</code> 目录并在 config.yaml 启用 server 插件后，这里可直接管理 Bot。
+                    通过酒馆插件启动独立版桥接服务器（<code>server/server.js</code>），不再在酒馆进程内运行内置 Server。
                 </small>
                 <div style="margin-top:6px;">
                     <input type="text" id="telegram_bot_token" class="text_pole" placeholder="Telegram Bot Token（如 123456:ABC...）" style="width:100%;">
                     <div style="margin-top:6px; display:flex; gap:6px; flex-wrap:wrap;">
                         <input id="telegram_token_save" class="menu_button" type="button" value="保存 Token" />
-                        <input id="telegram_server_start" class="menu_button" type="button" value="启动" />
+                        <input id="telegram_server_start" class="menu_button" type="button" value="🚀 启动 Server" />
                         <input id="telegram_server_stop" class="menu_button" type="button" value="停止" />
                         <input id="telegram_server_refresh" class="menu_button" type="button" value="刷新状态" />
                     </div>
@@ -28,7 +28,7 @@
 
             <!-- 基础连接设置 -->
             <div class="telegram-connector_block">
-                <label for="telegram_bridge_url">Bridge URL（留空 = 自动探测内置 Server）</label>
+                <label for="telegram_bridge_url">Bridge URL（留空 = 自动探测 Server）</label>
                 <input type="text" id="telegram_bridge_url" class="text_pole" placeholder="留空自动，或填写 ws://127.0.0.1:2333">
                 <div id="telegram_connection_status" style="margin-top: 10px; font-weight: bold;">状态： 请点击连接按钮</div>
             </div>
@@ -102,7 +102,7 @@
             <hr class="sysHR" />
             <small style="opacity:0.6; display:block;">
                 💡 使用提示：<br>
-                · <b>内置 Server 模式（推荐）</b>：装好 server 插件后，这里填 Token → 保存 → 启动 → 连接，URL 留空自动探测端口。<br>
+                · <b>启动 Server（推荐）</b>：酒馆启用 server 插件后，这里填 Token → 保存 → 🚀 启动 Server → 连接，URL 留空自动探测端口。<br>
                 · 或独立部署 <code>server/</code> 目录，Bridge URL 填 <code>ws://服务器IP:2333</code>。<br>
                 · 即时模式 + 合并窗口：玩家连续输入时 AI 不会逐条回复，攒一波再回。<br>
                 · 缓冲模式：适合多人轮流行动的 RPG 场景。<br>

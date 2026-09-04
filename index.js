@@ -168,8 +168,16 @@ async function ensureChatBinding(chatId) {
                 await doNewChat({ deleteCurrentChat: false });
 
                 const newChatId = context.getCurrentChatId();
-
-                await context.renameChat(newChatId, binding.chatName);
+                if (newChatId !== binding.chatName) {
+                    try {
+                        await context.renameChat(newChatId, binding.chatName);
+                    } catch (renameError) {
+                        // renameChat 失败（ST 弹 "Chat was not renamed" 错误）：
+                        // 直接用默认聊天名作为绑定，避免每条消息都重试新建+重命名
+                        console.error(`[Telegram Bridge] 重命名聊天失败，绑定改用默认名 ${newChatId}:`, renameError);
+                        binding.chatName = newChatId;
+                    }
+                }
 
             }
 
@@ -1201,7 +1209,7 @@ async function processMessage(item) {
 // --- WebSocket 连接 ---
 
 /**
- * 探测酒馆内置 Server（plugins/telegram-bridge）
+ * 探测 Server 插件状态（启动器模式，用于自动发现独立版服务器端口）
  * @returns {Promise<object|null>} { running, wssPort, configured, ... } 或 null（插件未安装）
  */
 async function discoverEmbeddedServer() {
@@ -1210,7 +1218,7 @@ async function discoverEmbeddedServer() {
         if (!response.ok) return null;
         return await response.json();
     } catch (error) {
-        console.warn('[Telegram Bridge] 内置 Server 探测失败:', error);
+        console.warn('[Telegram Bridge] Server 探测失败:', error);
         return null;
     }
 }
@@ -1223,18 +1231,18 @@ async function connect() {
     const settings = getSettings();
     let url = settings.bridgeUrl;
 
-    // bridgeUrl 留空 → 自动探测内置 Server（酒馆 Server 插件），自动获取端口
+    // bridgeUrl 留空 → 自动探测 Server（酒馆 Server 插件启动的独立版），自动获取端口
     if (!url) {
-        updateStatus('自动探测内置 Server...', 'orange');
+        updateStatus('自动探测 Server...', 'orange');
         const embedded = await discoverEmbeddedServer();
         if (embedded && embedded.running && embedded.wssPort) {
             const host = window.location.hostname || '127.0.0.1';
             url = `ws://${host}:${embedded.wssPort}`;
-            console.log(`[Telegram Bridge] 自动发现内置 Server，端口 ${embedded.wssPort}`);
+            console.log(`[Telegram Bridge] 自动发现 Server，端口 ${embedded.wssPort}`);
         } else {
             const reason = embedded ? (embedded.configured ? '未运行' : '未配置 Token') : '插件未安装';
-            console.error(`[Telegram Bridge] 内置 Server 不可用: ${reason}`);
-            updateStatus(`内置 Server 不可用（${reason}），请在设置面板配置`, 'red');
+            console.error(`[Telegram Bridge] Server 不可用: ${reason}`);
+            updateStatus(`Server 不可用（${reason}），请在设置面板启动`, 'red');
             return;
         }
     }
@@ -1888,7 +1896,7 @@ async function loadSettingsUI() {
     console.log('[Telegram Bridge] 自检 → settings.html 内容长度:', settingsHtml.length, '(新版约 6.5KB+)');
     console.log('[Telegram Bridge] 自检 → settings.html 含 Multiplayer 控件:', settingsHtml.includes('telegram_multiplayer_enabled'));
     console.log('[Telegram Bridge] 自检 → Multiplayer 选项:', $('#telegram_multiplayer_enabled').length > 0 ? '存在 ✅' : '缺失 ❌');
-    console.log('[Telegram Bridge] 自检 → 内置Server区块:', $('#telegram_server_start').length > 0 ? '存在 ✅' : '缺失 ❌');
+    console.log('[Telegram Bridge] 自检 → Server启动器区块:', $('#telegram_server_start').length > 0 ? '存在 ✅' : '缺失 ❌');
     console.log('[Telegram Bridge] 自检 → 合并窗口:', $('#telegram_merge_window').length > 0 ? '存在 ✅' : '缺失 ❌');
 }
 
@@ -1983,7 +1991,7 @@ function bindSettingsUI() {
     $('#telegram_connect_button').on('click', connect);
     $('#telegram_disconnect_button').on('click', disconnect);
 
-    // --- 内置 Server 管理（酒馆 Server 插件） ---
+    // --- Server 管理（酒馆 Server 插件启动器） ---
     bindEmbeddedServerControls();
 
     if (settings.autoConnect) {
@@ -1993,22 +2001,20 @@ function bindSettingsUI() {
 }
 
 /**
- * 刷新内置 Server 状态显示
+ * 刷新 Server 状态显示（启动器模式：running = 独立版 server.js 子进程存活）
  */
 async function refreshEmbeddedStatus() {
     const el = document.getElementById('telegram_server_status');
     if (!el) return;
     const embedded = await discoverEmbeddedServer();
     if (!embedded) {
-        el.innerHTML = '<span style="color:orange">插件未安装</span>（未检测到 plugins/telegram-bridge，将使用独立 Server 模式）';
+        el.innerHTML = '<span style="color:orange">插件未安装</span>（未检测到 plugins/telegram-bridge）';
         return;
     }
-    if (embedded.running && embedded.botConnected) {
-        el.innerHTML = `<span style="color:green">● 运行中</span> · WebSocket 端口 <b>${embedded.wssPort}</b> · Bot 已连接`;
-    } else if (embedded.running) {
-        el.innerHTML = `<span style="color:orange">● 运行中（Bot 未连接）</span> · 端口 ${embedded.wssPort}`;
+    if (embedded.running) {
+        el.innerHTML = `<span style="color:green">● 运行中</span> · WebSocket 端口 <b>${embedded.wssPort}</b>`;
     } else {
-        el.innerHTML = `<span style="color:red">○ 未运行</span>（${embedded.configured ? '已配置 Token，可点「启动」' : '未配置 Token，请先保存'}）`;
+        el.innerHTML = `<span style="color:red">○ 未运行</span>（${embedded.configured ? '已配置 Token，可点「🚀 启动 Server」' : '未配置 Token，请先保存'}）`;
     }
 }
 
@@ -2038,9 +2044,9 @@ function bindEmbeddedServerControls() {
             body: JSON.stringify({ telegramToken: token }),
         });
         const result = await response.json();
-        console.log('[Telegram Bridge] 启动内置 Server 结果:', result);
+        console.log('[Telegram Bridge] 启动 Server 结果:', result);
         if (result.ok && result.wssPort) {
-            toastr?.success?.(`内置 Server 已启动，端口 ${result.wssPort}`);
+            toastr?.success?.(`Server 已启动，端口 ${result.wssPort}`);
             // 若 URL 留空（自动模式），直接连接
             if (!getSettings().bridgeUrl) connect();
         } else {
@@ -2052,8 +2058,8 @@ function bindEmbeddedServerControls() {
     $('#telegram_server_stop').on('click', async () => {
         const response = await fetch('/api/plugins/telegram-bridge/stop', { method: 'POST' });
         const result = await response.json();
-        console.log('[Telegram Bridge] 停止内置 Server 结果:', result);
-        toastr?.success?.('内置 Server 已停止');
+        console.log('[Telegram Bridge] 停止 Server 结果:', result);
+        toastr?.success?.('Server 已停止');
         if (ws) disconnect();
         refreshEmbeddedStatus();
     });

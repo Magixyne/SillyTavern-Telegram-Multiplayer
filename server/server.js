@@ -4,7 +4,6 @@ const WebSocket = require('ws');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const MessageFormatter = require('./messageFormatter');
 
 // Telegram 消息长度限制
 const TELEGRAM_MAX_LENGTH = 4096;
@@ -1640,9 +1639,9 @@ wss.on('connection', ws => {
                 logWithTimestamp('log', `收到最终渲染文本，ChatID: ${data.chatId}, 长度: ${data.text?.length || 0}`);
                 const session = ongoingStreams.get(data.chatId);
 
-                // 格式化消息 (Requirement 3.4, 4.5, 6.2, 6.3, 6.4)
-                const formatConfig = config.messageFormat || {};
-                const formatted = MessageFormatter.format(data.text, formatConfig);
+                // 直接把原始消息塞过去：不做 markdown→HTML 转换与内容过滤，
+                // 避免复杂回复被转义/过滤导致发送失败或内容被改写
+                const rawText = data.text || '';
 
                 // 如果会话存在，说明是流式传输的最终更新
                 if (session) {
@@ -1665,43 +1664,22 @@ wss.on('connection', ws => {
                         logWithTimestamp('log', `收到流式最终渲染文本，更新消息 ${session.messageId}`);
 
                         // 检查消息是否超过 Telegram 限制
-                        if (formatted.text.length > 4000) {
-                            logWithTimestamp('log', `消息长度 ${formatted.text.length} 超过限制，删除原消息并分割发送`);
+                        if (rawText.length > 4000) {
+                            logWithTimestamp('log', `消息长度 ${rawText.length} 超过限制，删除原消息并分割发送`);
                             // 删除原来的流式消息
                             await bot.deleteMessage(data.chatId, session.messageId).catch(err => {
                                 logWithTimestamp('error', '删除原消息失败:', err.message);
                             });
-                            // 使用分割发送
-                            const sendOptions = {};
-                            if (formatted.parseMode) {
-                                sendOptions.parse_mode = formatted.parseMode;
-                            }
-                            await sendLongMessage(bot, data.chatId, formatted.text, sendOptions);
+                            // 原始文本分割发送（无 parse_mode）
+                            await sendLongMessage(bot, data.chatId, rawText);
                         } else {
-                            // 消息长度正常，直接编辑
-                            const messageOptions = {
+                            // 消息长度正常，直接编辑（纯文本，无 parse_mode）
+                            await bot.editMessageText(rawText, {
                                 chat_id: data.chatId,
                                 message_id: session.messageId,
-                            };
-
-                            // 根据配置设置 parse_mode (Requirement 6.2, 6.3, 6.4)
-                            if (formatted.parseMode) {
-                                messageOptions.parse_mode = formatted.parseMode;
-                            }
-
-                            await bot.editMessageText(formatted.text, messageOptions).catch(async err => {
+                            }).catch(err => {
                                 if (!err.message.includes('message is not modified')) {
-                                    logWithTimestamp('error', '编辑最终格式化Telegram消息失败:', err.message);
-                                    // 格式化失败回退机制 (Requirement 4.5)
-                                    if (formatted.parseMode) {
-                                        logWithTimestamp('log', '尝试回退到纯文本模式...');
-                                        await bot.editMessageText(data.text, {
-                                            chat_id: data.chatId,
-                                            message_id: session.messageId,
-                                        }).catch(fallbackErr => {
-                                            logWithTimestamp('error', '回退到纯文本模式也失败:', fallbackErr.message);
-                                        });
-                                    }
+                                    logWithTimestamp('error', '编辑最终Telegram消息失败:', err.message);
                                 }
                             });
                         }
@@ -1709,12 +1687,8 @@ wss.on('connection', ws => {
                     } else {
                         // 如果没有messageId，说明字符数未达到阈值，直接发送新消息
                         logWithTimestamp('log', `流式会话未发送初始消息，直接发送最终消息到 ChatID ${data.chatId}`);
-                        const sendOptions = {};
-                        if (formatted.parseMode) {
-                            sendOptions.parse_mode = formatted.parseMode;
-                        }
-                        // 使用支持超长消息的发送函数
-                        await sendLongMessage(bot, data.chatId, formatted.text, sendOptions);
+                        // 原始文本直发（无 parse_mode）
+                        await sendLongMessage(bot, data.chatId, rawText);
                     }
                     // 清理流式会话（取消兜底清理定时器，避免定时器残留）
                     clearTimeout(session.cleanupTimer);
@@ -1724,12 +1698,8 @@ wss.on('connection', ws => {
                 // 如果会话不存在，说明这是一个完整的非流式回复
                 else {
                     logWithTimestamp('log', `收到非流式完整回复，直接发送新消息到 ChatID ${data.chatId}`);
-                    const sendOptions = {};
-                    if (formatted.parseMode) {
-                        sendOptions.parse_mode = formatted.parseMode;
-                    }
-                    // 使用支持超长消息的发送函数
-                    await sendLongMessage(bot, data.chatId, formatted.text, sendOptions);
+                    // 原始文本直发（无 parse_mode）
+                    await sendLongMessage(bot, data.chatId, rawText);
                 }
                 return;
             }
@@ -1788,11 +1758,8 @@ wss.on('connection', ws => {
                     logWithTimestamp('log', '收到本地生成同步请求，但没有活跃的 Telegram 聊天，已忽略。');
                 } else {
                     logWithTimestamp('log', `酒馆本地生成同步 → chatId ${lastActiveChatId}`);
-                    const formatConfig = config.messageFormat || {};
-                    const formatted = MessageFormatter.format(data.text || '', formatConfig);
-                    const sendOptions = {};
-                    if (formatted.parseMode) sendOptions.parse_mode = formatted.parseMode;
-                    await sendLongMessage(bot, lastActiveChatId, formatted.text, sendOptions);
+                    // 原始文本直发，不做格式转换
+                    await sendLongMessage(bot, lastActiveChatId, data.text || '');
                 }
             } else if (data.type === 'command_executed') {
                 // 处理前端命令执行结果
@@ -2063,13 +2030,30 @@ bot.on('callback_query', async (callbackQuery) => {
     }
 });
 
+// 构建引用回复上下文：把被回复的消息（文本/贴纸/图片等）转成可见引文，让 AI 知道回复对象
+function buildReplyContext(replyTo) {
+    if (!replyTo) return '';
+    const sender = replyTo.from ? (replyTo.from.username || replyTo.from.first_name || '未知用户') : '未知用户';
+    let quoted = replyTo.text || replyTo.caption || '';
+    if (!quoted) {
+        if (replyTo.sticker) quoted = `贴纸${replyTo.sticker.emoji ? ' ' + replyTo.sticker.emoji : ''}`;
+        else if (replyTo.photo) quoted = '图片';
+        else if (replyTo.animation) quoted = 'GIF';
+        else if (replyTo.voice) quoted = '语音';
+        else if (replyTo.video) quoted = '视频';
+        else if (replyTo.document) quoted = `文件: ${replyTo.document.file_name || '未知文件'}`;
+    }
+    if (!quoted) return '';
+    return `[回复 @${sender}: "${String(quoted).slice(0, 200)}"] `;
+}
+
 // 监听Telegram消息
 
 bot.on('message', async (msg) => {
 
     const chatId = msg.chat.id;
 
-    const text = msg.text;
+    let text = msg.text;
 
     const userId = msg.from.id;
     lastActiveChatId = chatId; // 记录最近活跃的聊天（本地生成双向同步用）
@@ -2097,7 +2081,9 @@ bot.on('message', async (msg) => {
     // 消息中提到本 bot 用户名 → 标记为提及（随 user_message payload 传给前端）。
     // 前端收到后立即触发回复（跳过合并/缓冲窗口），并在首条 stream_chunk 上
     // 回传 mentioned，让服务器跳过字符阈值立即发送流式初始消息。无时间限制、无全局状态。
-    const mentioned = !!(text && myBotUsername && text.toLowerCase().includes(myBotUsername));
+    // 提及检测基于原始文本与媒体配文（caption），不含引用回复上下文，避免误触发
+    const mentionText = msg.text || msg.caption || '';
+    const mentioned = !!(mentionText && myBotUsername && mentionText.toLowerCase().includes(myBotUsername));
     if (mentioned) {
         logWithTimestamp('log', `消息中提到本 bot（@${myBotUsername}），立即触发回复`);
     }
@@ -2152,8 +2138,20 @@ bot.on('message', async (msg) => {
 
     }
 
-
-    if (!text) return;
+    // 非文本消息（贴纸/图片/GIF/语音/视频/文件）→ 占位描述，让 AI 知道用户发了什么
+    if (!text) {
+        if (msg.sticker) text = `[贴纸${msg.sticker.emoji ? ' ' + msg.sticker.emoji : ''}]`;
+        else if (msg.photo) text = '[图片]';
+        else if (msg.animation) text = '[GIF]';
+        else if (msg.voice) text = '[语音]';
+        else if (msg.video) text = '[视频]';
+        else if (msg.document) text = `[文件: ${msg.document.file_name || '未知文件'}]`;
+        else return; // 其他无内容类型（位置/联系人等）忽略
+    }
+    // 媒体配文（图片/文件等的 caption）
+    if (msg.caption) {
+        text = `${text}\n配文: ${msg.caption}`;
+    }
 
 
 
@@ -2199,6 +2197,12 @@ bot.on('message', async (msg) => {
     }
 
 
+
+    // 引用回复：附带被回复消息的上下文（仅普通消息，命令不附带）
+    if (msg.reply_to_message) {
+        const ctx = buildReplyContext(msg.reply_to_message);
+        if (ctx) text = ctx + text;
+    }
 
     // 处理普通消息
 
